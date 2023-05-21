@@ -6,16 +6,24 @@ https://github.com/allegroai/clearml
 import os.path
 # Always prefer setuptools over distutils
 from setuptools import setup, find_packages
+import codecs
 
 
 def read_text(filepath):
-    with open(filepath, "r", encoding="utf-8") as f:
+    with codecs.open(filepath, "r", encoding="utf-8") as f:
         return f.read()
 
 
 here = os.path.dirname(__file__)
 # Get the long description from the README file
 long_description = read_text(os.path.join(here, 'README.md'))
+
+# fix github, dark logo hack.
+long_description = long_description.replace(
+    """<img align="center" src="docs/clearml-logo.svg#gh-light-mode-only" alt="Clear|ML"><img align="center" src="docs/clearml-logo-dark.svg#gh-dark-mode-only" alt="Clear|ML">""",  # noqa
+    """<a href="https://app.clear.ml"><img src="https://github.com/allegroai/clearml/blob/master/docs/clearml-logo.svg?raw=true" width="250px"></a>""",  # noqa
+    1
+)
 
 
 def read_version_string(version_file):
@@ -39,8 +47,8 @@ setup(
     long_description_content_type='text/markdown',
     # The project's main homepage.
     url='https://github.com/allegroai/clearml',
-    author='Allegroai',
-    author_email='clearml@allegro.ai',
+    author='ClearML',
+    author_email='support@clear.ml',
     license='Apache License 2.0',
     classifiers=[
         'Development Status :: 5 - Production/Stable',
@@ -60,6 +68,8 @@ setup(
         'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
         'License :: OSI Approved :: Apache Software License',
     ],
     keywords='clearml trains development machine deep learning version control machine-learning machinelearning '
@@ -71,7 +81,7 @@ setup(
             'boto3>=1.9',
         ],
         'azure': [
-            'azure-storage-blob>=2.0.1,<=2.1',
+            'azure-storage-blob>=12.0.0',
         ],
         'gs': [
             'google-cloud-storage>=1.13.2',
@@ -89,6 +99,7 @@ setup(
             'clearml-init = clearml.cli.config.__main__:main',
             'clearml-data = clearml.cli.data.__main__:main',
             'clearml-task = clearml.cli.task.__main__:main',
+            'clearml-param-search = clearml.cli.hpo.__main__:main'
         ],
     },
 )

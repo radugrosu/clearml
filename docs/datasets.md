@@ -2,7 +2,7 @@
 
 ## Decoupling Data from Code - The Dataset Paradigm
 
-<a href="https://app.community.clear.ml"><img src="https://github.com/allegroai/clearml/blob/master/docs/dataset_screenshots.gif?raw=true" width="80%"></a>
+<a href="https://app.clear.ml"><img src="https://github.com/allegroai/clearml/blob/master/docs/dataset_screenshots.gif?raw=true" width="80%"></a>
 
 ### The ultimate goal of `clearml-data` is to transform datasets into configuration parameters
 Just like any other argument, the dataset argument should retrieve a full local copy of the
@@ -71,7 +71,7 @@ from clearml import Dataset
 dataset = Dataset.create(dataset_name='dataset name',dataset_project='dataset project')
 dataset.add_files('/path_to_data')
 dataset.upload()
-dataset.close()
+dataset.finalize()
 
 ```
 

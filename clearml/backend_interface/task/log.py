@@ -3,14 +3,12 @@ import sys
 from pathlib2 import Path
 from logging import LogRecord, getLogger, basicConfig, getLevelName, INFO, WARNING, Formatter, makeLogRecord, warning
 from logging.handlers import BufferingHandler
-from six.moves.queue import Queue as TrQueue
-from threading import Event as TrEvent
 
 from .development.worker import DevWorker
 from ...backend_api.services import events
 from ...backend_api.session.session import MaxRequestSizeError
 from ...config import config
-from ...utilities.process.mp import BackgroundMonitor
+from ...utilities.process.mp import BackgroundMonitor, ForkEvent, ForkQueue
 from ...utilities.process.mp import SafeQueue as PrQueue, SafeEvent
 
 
@@ -21,8 +19,8 @@ class BackgroundLogService(BackgroundMonitor):
         super(BackgroundLogService, self).__init__(task=task, wait_period=wait_period)
         self._worker = worker
         self._task_id = task.id
-        self._queue = TrQueue()
-        self._flush = TrEvent()
+        self._queue = ForkQueue()
+        self._flush = ForkEvent()
         self._last_event = None
         self._offline_log_filename = offline_log_filename
         self.session = session
@@ -76,13 +74,32 @@ class BackgroundLogService(BackgroundMonitor):
                 self._queue.put(a_request)
 
     def set_subprocess_mode(self):
-        if isinstance(self._queue, TrQueue):
+        if isinstance(self._queue, ForkQueue):
             self.send_all_records()
             self._queue = PrQueue()
         super(BackgroundLogService, self).set_subprocess_mode()
         self._flush = SafeEvent()
 
     def add_to_queue(self, record):
+        # check that we did not loose the reporter sub-process
+        if self.is_subprocess_mode() and not self._fast_is_subprocess_alive() and not self.get_at_exit_state():  # HANGS IF RACE HOLDS!
+            # we lost the reporting subprocess, let's switch to thread mode
+            # gel all data, work on local queue:
+            self.send_all_records()
+            # replace queue:
+            self._queue = ForkQueue()
+            self._flush = ForkEvent()
+            self._event = ForkEvent()
+            self._done_ev = ForkEvent()
+            self._start_ev = ForkEvent()
+            # set thread mode
+            self._subprocess = False
+            # start background thread
+            self._thread = None
+            self._start()
+            getLogger('clearml.log').warning(
+                'Event reporting sub-process lost, switching to thread based reporting')
+
         self._queue.put(record)
 
     def empty(self):
@@ -193,7 +210,7 @@ class TaskHandler(BufferingHandler):
             self._offline_log_filename = offline_folder / self.__offline_filename
         self._background_log = BackgroundLogService(
             worker=task.session.worker, task=task,
-            session=task.session, wait_period=DevWorker.report_period,
+            session=task.session, wait_period=float(DevWorker.report_period),
             offline_log_filename=self._offline_log_filename)
         self._background_log_size = 0
         if use_subprocess:
@@ -256,7 +273,8 @@ class TaskHandler(BufferingHandler):
         if _background_log:
             if not _background_log.is_subprocess_mode() or _background_log.is_alive():
                 _background_log.stop()
-                if wait:
+                if wait and (not _background_log.is_subprocess_mode() or
+                             _background_log.is_subprocess_mode_and_parent_process()):
                     # noinspection PyBroadException
                     try:
                         timeout = 1. if _background_log.empty() else self.__wait_for_flush_timeout
@@ -274,7 +292,7 @@ class TaskHandler(BufferingHandler):
         super(TaskHandler, self).close()
 
     @classmethod
-    def report_offline_session(cls, task, folder):
+    def report_offline_session(cls, task, folder, iteration_offset=0):
         filename = Path(folder) / cls.__offline_filename
         if not filename.is_file():
             return False
@@ -288,6 +306,11 @@ class TaskHandler(BufferingHandler):
                     list_requests = json.loads(line)
                     for r in list_requests:
                         r.pop('task', None)
+                        # noinspection PyBroadException
+                        try:
+                            r["iter"] += iteration_offset
+                        except Exception:
+                            pass
                     i += 1
                 except StopIteration:
                     break

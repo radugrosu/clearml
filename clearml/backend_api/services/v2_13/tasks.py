@@ -137,7 +137,7 @@ class Script(NonStrictDataModel):
     :type repository: str
     :param tag: Repository tag
     :type tag: str
-    :param branch: Repository branch id If not provided and tag not provided,
+    :param branch: Repository branch ID If not provided and tag not provided,
         default repository branch is used.
     :type branch: str
     :param version_num: Version (changeset) number. Optional (default is head
@@ -1537,7 +1537,7 @@ class Task(NonStrictDataModel):
             "container": {
                 "type": "object",
                 "description": "Docker container parameters",
-                "additionalProperties": {"type": "string"},
+                "additionalProperties": {"type": ["string", "null"]},
             },
             "created": {
                 "description": "Task creation time (UTC) ",
@@ -3142,7 +3142,7 @@ class CloneRequest(Request):
                 "type": "object",
             },
             "new_task_container": {
-                "additionalProperties": {"type": "string"},
+                "additionalProperties": {"type": ["string", "null"]},
                 "description": "The docker container properties for the new task. If not provided then taken from the original task",
                 "type": "object",
             },
@@ -3838,12 +3838,12 @@ class CreateRequest(Request):
     :type type: TaskTypeEnum
     :param comment: Free text comment
     :type comment: str
-    :param parent: Parent task id Must be a completed task.
+    :param parent: Parent task ID Must be a completed task.
     :type parent: str
     :param project: Project ID of the project to which this task is assigned Must
         exist[ab]
     :type project: str
-    :param output_dest: Output storage id Must be a reference to an existing
+    :param output_dest: Output storage ID Must be a reference to an existing
         storage.
     :type output_dest: str
     :param execution: Task execution params
@@ -4103,7 +4103,7 @@ class CreateRequest(Request):
             "container": {
                 "type": "object",
                 "description": "Docker container parameters",
-                "additionalProperties": {"type": "string"},
+                "additionalProperties": {"type": ["string", "null"]},
             },
             "execution": {
                 "$ref": "#/definitions/execution",
@@ -6123,7 +6123,7 @@ class EditRequest(Request):
             "container": {
                 "type": "object",
                 "description": "Docker container parameters",
-                "additionalProperties": {"type": "string"},
+                "additionalProperties": {"type": ["string", "null"]},
             },
             "execution": {
                 "$ref": "#/definitions/execution",
@@ -8166,7 +8166,7 @@ class GetAllResponse(Response):
                     "container": {
                         "type": "object",
                         "description": "Docker container parameters",
-                        "additionalProperties": {"type": "string"},
+                        "additionalProperties": {"type": ["string", "null"]},
                     },
                     "created": {
                         "description": "Task creation time (UTC) ",
@@ -8700,7 +8700,7 @@ class GetByIdResponse(Response):
                     "container": {
                         "type": "object",
                         "description": "Docker container parameters",
-                        "additionalProperties": {"type": "string"},
+                        "additionalProperties": {"type": ["string", "null"]},
                     },
                     "created": {
                         "description": "Task creation time (UTC) ",
@@ -12187,7 +12187,7 @@ class ValidateRequest(Request):
             "container": {
                 "type": "object",
                 "description": "Docker container parameters",
-                "additionalProperties": {"type": "string"},
+                "additionalProperties": {"type": ["string", "null"]},
             },
             "execution": {
                 "$ref": "#/definitions/execution",

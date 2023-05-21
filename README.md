@@ -1,43 +1,72 @@
-<div align="center">
+<div align="center" style="text-align: center">
 
-<a href="https://app.community.clear.ml"><img src="https://github.com/allegroai/clearml/blob/master/docs/clearml-logo.svg?raw=true" width="250px"></a>
+<p style="text-align: center">
+  <img align="center" src="docs/clearml-logo.svg#gh-light-mode-only" alt="Clear|ML"><img align="center" src="docs/clearml-logo-dark.svg#gh-dark-mode-only" alt="Clear|ML">
+</p>
 
+**[ClearML](https://clear.ml) - Auto-Magical Suite of tools to streamline your ML workflow
+</br>Experiment Manager, MLOps and Data-Management**
 
-**ClearML - Auto-Magical Suite of tools to streamline your ML workflow 
-</br>Experiment Manager, ML-Ops and Data-Management**
-
-[![GitHub license](https://img.shields.io/github/license/allegroai/clearml.svg)](https://img.shields.io/github/license/allegroai/clearml.svg)
-[![PyPI pyversions](https://img.shields.io/pypi/pyversions/clearml.svg)](https://img.shields.io/pypi/pyversions/clearml.svg)
-[![PyPI version shields.io](https://img.shields.io/pypi/v/clearml.svg)](https://img.shields.io/pypi/v/clearml.svg)
-[![Optuna](https://img.shields.io/badge/Optuna-integrated-blue)](https://optuna.org)
-[![Slack Channel](https://img.shields.io/badge/slack-%23clearml--community-blueviolet?logo=slack)](https://join.slack.com/t/clearml/shared_invite/zt-c0t13pty-aVUZZW1TSSSg2vyIGVPBhg)
-[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/allegroai)](https://artifacthub.io/packages/search?repo=allegroai)
+[![GitHub license](https://img.shields.io/github/license/allegroai/clearml.svg)](https://img.shields.io/github/license/allegroai/clearml.svg) [![PyPI pyversions](https://img.shields.io/pypi/pyversions/clearml.svg)](https://img.shields.io/pypi/pyversions/clearml.svg) [![PyPI version shields.io](https://img.shields.io/pypi/v/clearml.svg)](https://pypi.org/project/clearml/) [![Conda version shields.io](https://img.shields.io/conda/v/clearml/clearml)](https://anaconda.org/clearml/clearml) [![Optuna](https://img.shields.io/badge/Optuna-integrated-blue)](https://optuna.org)<br>
+[![PyPI Downloads](https://pepy.tech/badge/clearml/month)](https://pypi.org/project/clearml/) [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/allegroai)](https://artifacthub.io/packages/search?repo=allegroai) [![Youtube](https://img.shields.io/badge/ClearML-DD0000?logo=youtube&logoColor=white)](https://www.youtube.com/c/clearml) [![Slack Channel](https://img.shields.io/badge/slack-%23clearml--community-blueviolet?logo=slack)](https://join.slack.com/t/clearml/shared_invite/zt-1v74jzwkn-~XsuWB0btXOlfFQCh8DJQw) [![Signup](https://img.shields.io/badge/Clear%7CML-Signup-brightgreen)](https://app.clear.ml)
 
 </div>
 
 ---
 ### ClearML
-#### *Formerly known as Allegro Trains*
-ClearML is a ML/DL development and production suite, it contains three main modules:
+<sup>*Formerly known as Allegro Trains*<sup>
+
+ClearML is a ML/DL development and production suite, it contains FIVE main modules:
 
 - [Experiment Manager](#clearml-experiment-manager) - Automagical experiment tracking, environments and results
-- [ML-Ops](https://github.com/allegroai/clearml-agent) - Automation, Pipelines & Orchestration solution for ML/DL jobs (K8s / Cloud / bare-metal)  
+- [MLOps](https://github.com/allegroai/clearml-agent) - Orchestration, Automation & Pipelines solution for ML/DL jobs (K8s / Cloud / bare-metal)  
 - [Data-Management](https://github.com/allegroai/clearml/blob/master/docs/datasets.md) - Fully differentiable data management & version control solution on top of object-storage 
-  (S3/GS/Azure/NAS)  
+  (S3 / GS / Azure / NAS)  
+- [Model-Serving](https://github.com/allegroai/clearml-serving) - *cloud-ready* Scalable model serving solution! 
+  - **Deploy new model endpoints in under 5 minutes** 
+  - Includes optimized GPU serving support backed by Nvidia-Triton 
+  - **with out-of-the-box  Model Monitoring** 
+- **NEW** :fire: [Reports](https://clear.ml/docs/latest/docs/webapp/webapp_reports) - Create and share rich MarkDown documents supporting embeddable online content 
   
 
-Instrumenting these components is the **ClearML-server**, see [Self-Hosting](https://clear.ml/docs/latest/docs/deploying_clearml/clearml_server) & [Free tier Hosting](https://app.community.clear.ml)  
+Instrumenting these components is the **ClearML-server**, see [Self-Hosting](https://clear.ml/docs/latest/docs/deploying_clearml/clearml_server) & [Free tier Hosting](https://app.clear.ml)  
 
 
 ---
 <div align="center">
 
-**[Sign up](https://app.community.clear.ml)  &  [Start using](https://clear.ml/docs/) in under 2 minutes**  
+**[Sign up](https://app.clear.ml)  &  [Start using](https://clear.ml/docs/) in under 2 minutes**
+
+---
+**Friendly tutorials to get you started**
+
+<table>
+<tbody>
+  <tr>
+    <td><a href="https://github.com/allegroai/clearml/blob/master/docs/tutorials/Getting_Started_1_Experiment_Management.ipynb"><b>Step 1</b></a> - Experiment Management</td>
+    <td><a target="_blank" href="https://colab.research.google.com/github/allegroai/clearml/blob/master/docs/tutorials/Getting_Started_1_Experiment_Management.ipynb">
+  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
+</a></td>
+  </tr>
+  <tr>
+    <td><a href="https://github.com/allegroai/clearml/blob/master/docs/tutorials/Getting_Started_2_Setting_Up_Agent.ipynb"><b>Step 2</b></a> - Remote Execution Agent Setup</td>
+    <td><a target="_blank" href="https://colab.research.google.com/github/allegroai/clearml/blob/master/docs/tutorials/Getting_Started_2_Setting_Up_Agent.ipynb">
+  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
+</a></td>
+  </tr>
+  <tr>
+    <td><a href="https://github.com/allegroai/clearml/blob/master/docs/tutorials/Getting_Started_3_Remote_Execution.ipynb"><b>Step 3</b></a> - Remotely Execute Tasks</td>
+    <td><a target="_blank" href="https://colab.research.google.com/github/allegroai/clearml/blob/master/docs/tutorials/Getting_Started_3_Remote_Execution.ipynb">
+  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
+</a></td>
+  </tr>
+</tbody>
+</table>
 
 </div>
 
 ---
-<a href="https://app.community.clear.ml"><img src="https://github.com/allegroai/clearml/blob/master/docs/webapp_screenshots.gif?raw=true" width="100%"></a>
+<a href="https://app.clear.ml"><img src="https://github.com/allegroai/clearml/blob/master/docs/webapp_screenshots.gif?raw=true" width="100%"></a>
 
 ## ClearML Experiment Manager
 
@@ -47,7 +76,7 @@ Instrumenting these components is the **ClearML-server**, see [Self-Hosting](htt
     * Full source control info including non-committed local changes
     * Execution environment (including specific packages & versions)
     * Hyper-parameters
-        * ArgParser/[Click](https://github.com/pallets/click/) for command line parameters with currently used values
+        * ArgParser/[Click](https://github.com/pallets/click/)/[PythonFire](https://github.com/google/python-fire) for command line parameters with currently used values
         * Explicit parameters dictionary
         * Tensorflow Defines (absl-py)
         * [Hydra](https://github.com/facebookresearch/hydra) configuration and overrides
@@ -57,28 +86,45 @@ Instrumenting these components is the **ClearML-server**, see [Self-Hosting](htt
     * Resource Monitoring (CPU/GPU utilization, temperature, IO, network, etc.)
     * Model snapshots (With optional automatic upload to central storage: Shared folder, S3, GS, Azure, Http)
     * Artifacts log & store (Shared folder, S3, GS, Azure, Http)
-    * Tensorboard/TensorboardX scalars, metrics, histograms, **images, audio and video samples**
+    * Tensorboard/[TensorboardX](https://github.com/allegroai/clearml/tree/master/examples/frameworks/tensorboardx) scalars, metrics, histograms, **images, audio and video samples**
     * [Matplotlib & Seaborn](https://github.com/allegroai/clearml/tree/master/examples/frameworks/matplotlib)
     * [ClearML Logger](https://clear.ml/docs/latest/docs/fundamentals/logger) interface for complete flexibility.
 * Extensive platform support and integrations
-    * Supported ML/DL frameworks: [PyTorch](https://github.com/allegroai/clearml/tree/master/examples/frameworks/pytorch)(incl' ignite/lightning), [Tensorflow](https://github.com/allegroai/clearml/tree/master/examples/frameworks/tensorflow), [Keras](https://github.com/allegroai/clearml/tree/master/examples/frameworks/keras), [AutoKeras](https://github.com/allegroai/clearml/tree/master/examples/frameworks/autokeras), [XGBoost](https://github.com/allegroai/clearml/tree/master/examples/frameworks/xgboost) and [Scikit-Learn](https://github.com/allegroai/clearml/tree/master/examples/frameworks/scikit-learn)
-    * Seamless integration (including version control) with **Jupyter Notebook**
+    * Supported ML/DL frameworks: [PyTorch](https://github.com/allegroai/clearml/tree/master/examples/frameworks/pytorch) (incl' [ignite](https://github.com/allegroai/clearml/tree/master/examples/frameworks/ignite) / [lightning](https://github.com/allegroai/clearml/tree/master/examples/frameworks/pytorch-lightning)), [Tensorflow](https://github.com/allegroai/clearml/tree/master/examples/frameworks/tensorflow), [Keras](https://github.com/allegroai/clearml/tree/master/examples/frameworks/keras), [AutoKeras](https://github.com/allegroai/clearml/tree/master/examples/frameworks/autokeras), [FastAI](https://github.com/allegroai/clearml/tree/master/examples/frameworks/fastai), [XGBoost](https://github.com/allegroai/clearml/tree/master/examples/frameworks/xgboost), [LightGBM](https://github.com/allegroai/clearml/tree/master/examples/frameworks/lightgbm), [MegEngine](https://github.com/allegroai/clearml/tree/master/examples/frameworks/megengine) and [Scikit-Learn](https://github.com/allegroai/clearml/tree/master/examples/frameworks/scikit-learn)
+    * Seamless integration (including version control) with [**Jupyter Notebook**](https://jupyter.org/)
     and [*PyCharm* remote debugging](https://github.com/allegroai/trains-pycharm-plugin)
       
 #### [Start using ClearML](https://clear.ml/docs/latest/docs/getting_started/ds/ds_first_steps) 
 
-```bash
-pip install clearml
-```
 
-Add two lines to your code:
-```python
-from clearml import Task
-task = Task.init(project_name='examples', task_name='hello world')
-```
+1. Sign up for free to the [ClearML Hosted Service](https://app.clear.ml) (alternatively, you can set up your own server, see [here](https://clear.ml/docs/latest/docs/deploying_clearml/clearml_server)).
+
+    > **_ClearML Demo Server:_** ClearML no longer uses the demo server by default. To enable the demo server, set the `CLEARML_NO_DEFAULT_SERVER=0`
+    > environment variable. Credentials aren't needed, but experiments launched to the demo server are public, so make sure not 
+    > to launch sensitive experiments if using the demo server.
+
+1. Install the `clearml` python package:
+
+    ```bash
+    pip install clearml
+    ```
+
+1. Connect the ClearML SDK to the server by [creating credentials](https://app.clear.ml/settings/workspace-configuration), then execute the command
+below and follow the instructions: 
+
+    ```bash
+    clearml-init
+    ```
+
+1. Add two lines to your code:
+    ```python
+    from clearml import Task
+    task = Task.init(project_name='examples', task_name='hello world')
+    ```
 
 You are done, everything your process outputs is now automagically logged into ClearML.
-<br>Next step automation! **Learn more on ClearML two clicks automation [here](https://clear.ml/docs/latest/docs/getting_started/mlops/mlops_first_steps)** 
+
+Next step, automation! **Learn more about ClearML's two-click automation [here](https://clear.ml/docs/latest/docs/getting_started/mlops/mlops_first_steps)**. 
 
 ## ClearML Architecture
 
@@ -121,7 +167,7 @@ experiment management,ML-Ops and data management.
 
 ## Who We Are
 
-ClearML is supported by the team behind *allegro.ai*,
+ClearML is supported by the team behind [clear.ml](https://clear.ml),
 where we build deep learning pipelines and infrastructure for enterprise companies.
 
 We built ClearML to track and control the glorious but messy process of training production-grade deep learning models.
@@ -134,21 +180,32 @@ will always upgrade with you.
 
 Apache License, Version 2.0 (see the [LICENSE](https://www.apache.org/licenses/LICENSE-2.0.html) for more information)
 
+If ClearML is part of your development process / project / publication, please cite us :heart: : 
+```
+@misc{clearml,
+title = {ClearML - Your entire MLOps stack in one open-source tool},
+year = {2019},
+note = {Software available from http://github.com/allegroai/clearml},
+url={https://clear.ml/},
+author = {ClearML},
+}
+```
+
 ## Documentation, Community & Support
 
 More information in the [official documentation](https://clear.ml/docs) and [on YouTube](https://www.youtube.com/c/ClearML).
 
 For examples and use cases, check the [examples folder](https://github.com/allegroai/clearml/tree/master/examples) and [corresponding documentation](https://clear.ml/docs/latest/docs/guides).
 
-If you have any questions: post on our [Slack Channel](https://join.slack.com/t/clearml/shared_invite/zt-c0t13pty-aVUZZW1TSSSg2vyIGVPBhg), or tag your questions on [stackoverflow](https://stackoverflow.com/questions/tagged/clearml) with '**[clearml](https://stackoverflow.com/questions/tagged/clearml)**' tag (*previously [trains](https://stackoverflow.com/questions/tagged/trains) tag*).
+If you have any questions: post on our [Slack Channel](https://join.slack.com/t/clearml/shared_invite/zt-1v74jzwkn-~XsuWB0btXOlfFQCh8DJQw), or tag your questions on [stackoverflow](https://stackoverflow.com/questions/tagged/clearml) with '**[clearml](https://stackoverflow.com/questions/tagged/clearml)**' tag (*previously [trains](https://stackoverflow.com/questions/tagged/trains) tag*).
 
 For feature requests or bug reports, please use [GitHub issues](https://github.com/allegroai/clearml/issues).
 
-Additionally, you can always find us at *clearml@allegro.ai*
+Additionally, you can always find us at *info@clear.ml*
 
 ## Contributing
 
-**PRs are always welcomed** :heart: See more details in the ClearML [Guidelines for Contributing](https://github.com/allegroai/clearml/blob/master/docs/contributing.md).
+**PRs are always welcome** :heart: See more details in the ClearML [Guidelines for Contributing](https://github.com/allegroai/clearml/blob/master/docs/contributing.md).
 
 
 _May the force (and the goddess of learning rates) be with you!_

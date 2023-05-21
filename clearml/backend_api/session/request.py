@@ -5,10 +5,18 @@ import six
 
 from .apimodel import ApiModel
 from .datamodel import DataModel
+from .defs import ENV_API_DEFAULT_REQ_METHOD
+
+
+if ENV_API_DEFAULT_REQ_METHOD.exists() and ENV_API_DEFAULT_REQ_METHOD.get().upper() not in ("GET", "POST", "PUT"):
+    raise ValueError(
+        "CLEARML_API_DEFAULT_REQ_METHOD environment variable must be 'get' or 'post' (any case is allowed)."
+    )
 
 
 class Request(ApiModel):
-    _method = 'get'
+    def_method = ENV_API_DEFAULT_REQ_METHOD.get(default="get")
+    _method = ENV_API_DEFAULT_REQ_METHOD.get(default="get")
 
     def __init__(self, **kwargs):
         allow_extra_fields = kwargs.pop("_allow_extra_fields_", False)
@@ -81,7 +89,12 @@ class CompoundRequest(Request):
         return item
 
     def to_dict(self):
-        return self._get_item().to_dict()
+        dict_ = self._get_item().to_dict()
+        dict_properties = super(Request, self).to_dict()
+        if self._item_prop_name in dict_properties:
+            del dict_properties[self._item_prop_name]
+        dict_.update(dict_properties)
+        return dict_
 
     def validate(self):
         return self._get_item().validate(self._schema)

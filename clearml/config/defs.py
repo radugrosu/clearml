@@ -20,10 +20,13 @@ TASK_LOG_ENVIRONMENT = EnvEntry("CLEARML_LOG_ENVIRONMENT", "TRAINS_LOG_ENVIRONME
 CLEARML_CACHE_DIR = EnvEntry("CLEARML_CACHE_DIR", "TRAINS_CACHE_DIR")
 DEBUG_SIMULATE_REMOTE_TASK = EnvEntry("CLEARML_SIMULATE_REMOTE_TASK", type=bool)
 DEV_DEFAULT_OUTPUT_URI = EnvEntry("CLEARML_DEFAULT_OUTPUT_URI", type=str)
+TASK_SET_ITERATION_OFFSET = EnvEntry("CLEARML_SET_ITERATION_OFFSET", type=int)
 
 LOG_LEVEL_ENV_VAR = EnvEntry("CLEARML_LOG_LEVEL", "TRAINS_LOG_LEVEL", converter=or_(int, str))
 
 SUPPRESS_UPDATE_MESSAGE_ENV_VAR = EnvEntry("CLEARML_SUPPRESS_UPDATE_MESSAGE", "TRAINS_SUPPRESS_UPDATE_MESSAGE", type=bool)
+
+MAX_SERIES_PER_METRIC = EnvEntry("CLEARML_MAX_SERIES_PER_METRIC", default=100, type=int)
 
 # Repository detection
 VCS_REPO_TYPE = EnvEntry("CLEARML_VCS_REPO_TYPE", "TRAINS_VCS_REPO_TYPE", default="git")
@@ -31,5 +34,16 @@ VCS_REPOSITORY_URL = EnvEntry("CLEARML_VCS_REPO_URL", "TRAINS_VCS_REPO_URL")
 VCS_COMMIT_ID = EnvEntry("CLEARML_VCS_COMMIT_ID", "TRAINS_VCS_COMMIT_ID")
 VCS_BRANCH = EnvEntry("CLEARML_VCS_BRANCH", "TRAINS_VCS_BRANCH")
 VCS_ROOT = EnvEntry("CLEARML_VCS_ROOT", "TRAINS_VCS_ROOT")
+VCS_WORK_DIR = EnvEntry("CLEARML_VCS_WORK_DIR")
+VCS_ENTRY_POINT = EnvEntry("CLEARML_VCS_ENTRY_POINT")
 VCS_STATUS = EnvEntry("CLEARML_VCS_STATUS", "TRAINS_VCS_STATUS", converter=base64_to_text)
 VCS_DIFF = EnvEntry("CLEARML_VCS_DIFF", "TRAINS_VCS_DIFF", converter=base64_to_text)
+"""
+Handles repository or script diff
+
+Environment variable primarily for internal use. Expects a base64 encoded string.
+If explicitly set to an empty string, will not log the diff, shown in the UI under "Uncommitted Changes".
+
+.. note::
+    Overriding `CLEARML_VCS_DIFF` may change the results of a task when executed remotely.
+"""

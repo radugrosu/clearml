@@ -33,9 +33,12 @@ class ModelsList(UserList):
         except KeyError:
             return default
 
+    def keys(self):
+        return self._models.keys()
+
 
 class TaskModels(UserDict):
-    _input_models_re = re.compile(pattern=r"((?i)(Using model id: )(\w+)?)", flags=0)
+    _input_models_re = re.compile(pattern=r"((Using model id: )(\w+)?)", flags=re.IGNORECASE)
 
     @property
     def input(self):
@@ -80,18 +83,19 @@ class TaskModels(UserDict):
             except Exception:
                 pass
 
-        # remove duplicates and preserve order
-        input_models = OrderedDict(
-            (m_id, "Input Model #{}".format(i))
-            for i, m_id in enumerate(
-                filter(None, map(get_model, OrderedDict.fromkeys(parsed_ids)))
-            )
-        )
-
-        if not input_models and Session.check_min_api_version("2.13"):
-            # Only new 2.13 task.models.input in case we have no parsed models
+        # noinspection PyProtectedMember
+        if Session.check_min_api_version("2.13") and task._get_task_property(
+                "models.input", raise_on_error=False, log_on_error=False):
             input_models = OrderedDict(
                 (x.name, get_model(x.model)) for x in task.data.models.input
+            )
+        else:
+            # remove duplicates and preserve order
+            input_models = OrderedDict(
+                ("Input Model #{}".format(i), a_model)
+                for i, a_model in enumerate(
+                    filter(None, map(get_model, OrderedDict.fromkeys(parsed_ids)))
+                )
             )
 
         return ModelsList(input_models)

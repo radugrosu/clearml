@@ -1,12 +1,16 @@
 import yaml
 
+from enum import Enum
 from inspect import isfunction
 from six import PY2
 from argparse import _StoreAction, ArgumentError, _StoreConstAction, _SubParsersAction, _AppendAction, SUPPRESS  # noqa
 from copy import copy
 
+from typing import Tuple, Type, Union
+
 from ...backend_api import Session
 from ...binding.args import call_original_argparser
+from ...utilities.proxy_object import get_type_from_basic_type_str
 
 
 class _Arguments(object):
@@ -71,7 +75,7 @@ class _Arguments(object):
         name = option_strings[0].strip('- \t') if isinstance(option_strings, list) else option_strings.strip('- \t')
         if Session.check_min_api_version('2.9'):
             name = self._prefix_args + name
-        self._task.set_parameter(name=name, value=default, description=help)
+        self._task.set_parameter(name=name, value=default, description=help, value_type=type)
 
     def connect(self, parser):
         self._task.connect_argparse(parser)
@@ -179,15 +183,16 @@ class _Arguments(object):
 
         # Skip excluded arguments, Add prefix.
         if Session.check_min_api_version('2.9'):
+            include_all = self._exclude_parser_args.get("*", True)
             task_defaults = dict(
                 [(self._prefix_args + k, v) for k, v in task_defaults.items()
-                 if self._exclude_parser_args.get(k, True)])
+                 if self._exclude_parser_args.get(k, include_all)])
             task_defaults_descriptions = dict(
                 [(self._prefix_args + k, v) for k, v in task_defaults_descriptions.items()
-                 if self._exclude_parser_args.get(k, True)])
+                 if self._exclude_parser_args.get(k, include_all)])
             task_defaults_types = dict(
                 [(self._prefix_args + k, v) for k, v in task_defaults_types.items()
-                 if self._exclude_parser_args.get(k, True)])
+                 if self._exclude_parser_args.get(k, include_all)])
         else:
             task_defaults = dict(
                 [(k, v) for k, v in task_defaults.items() if self._exclude_parser_args.get(k, True)])
@@ -212,6 +217,16 @@ class _Arguments(object):
                 if _action:
                     _actions.extend(_action)
         return _actions
+
+    @classmethod
+    def _remove_req_flag_from_mutex_groups(cls, parser):
+        # noinspection PyBroadException
+        try:
+            # noinspection PyProtectedMember
+            for group in parser._mutually_exclusive_groups:
+                group.required = False
+        except Exception:
+            pass
 
     def copy_to_parser(self, parser, parsed_args):
         def cast_to_bool_int(value, strip=False):
@@ -245,7 +260,10 @@ class _Arguments(object):
             # with the rest we have to make sure the type is correct
             matched_actions = self._find_parser_action(parser, k)
             for parent_parser, current_action in matched_actions:
-                if current_action and isinstance(current_action, _StoreConstAction):
+                if current_action and current_action.default == SUPPRESS and not v:
+                    # this value should be kept suppressed, do nothing
+                    v = SUPPRESS
+                elif current_action and isinstance(current_action, _StoreConstAction):
                     # make the default value boolean
                     # first check if False value
                     const_value = current_action.const if current_action.const is not None else (
@@ -310,7 +328,13 @@ class _Arguments(object):
                     # now we should try and cast the value if we can
                     # noinspection PyBroadException
                     try:
-                        v = var_type(v)
+                        # Since we have no actual var type here, we check if the string presentation of the original
+                        # default value and the new value are the same, if they are,
+                        # we should just use the original default value
+                        if str(v) == str(current_action.default):
+                            v = current_action.default
+                        else:
+                            v = var_type(v)
                         # cast back to int if it's the same value
                         if type(current_action.default) == int and int(v) == v:
                             arg_parser_arguments[k] = v = int(v)
@@ -399,6 +423,8 @@ class _Arguments(object):
                 except Exception:
                     pass
 
+        self._remove_req_flag_from_mutex_groups(parser)
+
         # if API supports sections, we can update back the Args section with all the missing default
         if Session.check_min_api_version('2.9') and not self._exclude_parser_args.get('*', None):
             # noinspection PyBroadException
@@ -437,7 +463,7 @@ class _Arguments(object):
             if descriptions:
                 descriptions = dict((prefix+k, v) for k, v in descriptions.items())
             if param_types:
-                param_types = dict((prefix+k, v) for k, v in param_types.items())
+                param_types = dict((prefix + k, v) for k, v in param_types.items())
             # this will only set the specific section
             self._task.update_parameters(
                 dictionary,
@@ -464,7 +490,15 @@ class _Arguments(object):
             prefix = prefix.strip(self._prefix_sep) + self._prefix_sep
             parameters = dict([(k[len(prefix):], v) for k, v in self._task.get_parameters().items()
                                if k.startswith(prefix)])
+            # noinspection PyProtectedMember
+            parameters_type = {
+                k: p.type
+                for k, p in ((self._task._get_task_property('hyperparams', raise_on_error=False) or {}).get(
+                    prefix[:-len(self._prefix_sep)]) or {}).items()
+                if p.type
+            }
         else:
+            parameters_type = {}
             parameters = dict([(k, v) for k, v in self._task.get_parameters().items()
                                if not k.startswith(self._prefix_tf_defines)])
 
@@ -478,10 +512,25 @@ class _Arguments(object):
             param = parameters.get(k, None)
             if param is None:
                 continue
-            v_type = type(v)
+
+            # if default value is not specified, allow casting based on what we have on the Task
+            if v is not None:
+                v_type = type(v)
+            elif parameters_type.get(k):
+                v_type_str = parameters_type.get(k)
+                v_type = get_type_from_basic_type_str(v_type_str)
+            else:
+                # this will be type(None), we deal with it later
+                v_type = type(v)
+
+            def warn_failed_parsing():
+                self._task.log.warning(
+                    "Failed parsing task parameter {}={} keeping default {}={}".format(k, param, k, v)
+                )
+
             # assume more general purpose type int -> float
             if v_type == int:
-                if int(v) != float(v):
+                if v is not None and int(v) != float(v):
                     v_type = float
             elif v_type == bool:
                 # cast based on string or int
@@ -491,8 +540,7 @@ class _Arguments(object):
                     try:
                         param = str(param).lower().strip() == 'true'
                     except ValueError:
-                        self._task.log.warning('Failed parsing task parameter %s=%s keeping default %s=%s' %
-                                               (str(k), str(param), str(k), str(v)))
+                        warn_failed_parsing()
                         continue
             elif v_type == list:
                 # noinspection PyBroadException
@@ -500,8 +548,7 @@ class _Arguments(object):
                     p = str(param).strip()
                     param = yaml.load(p, Loader=FloatSafeLoader)
                 except Exception:
-                    self._task.log.warning('Failed parsing task parameter %s=%s keeping default %s=%s' %
-                                           (str(k), str(param), str(k), str(v)))
+                    warn_failed_parsing()
                     continue
             elif v_type == tuple:
                 # noinspection PyBroadException
@@ -509,8 +556,7 @@ class _Arguments(object):
                     p = str(param).strip().replace('(', '[', 1)[::-1].replace(')', ']', 1)[::-1]
                     param = tuple(yaml.load(p, Loader=FloatSafeLoader))
                 except Exception:
-                    self._task.log.warning('Failed parsing task parameter %s=%s keeping default %s=%s' %
-                                           (str(k), str(param), str(k), str(v)))
+                    warn_failed_parsing()
                     continue
             elif v_type == dict:
                 # noinspection PyBroadException
@@ -518,8 +564,14 @@ class _Arguments(object):
                     p = str(param).strip()
                     param = yaml.load(p, Loader=FloatSafeLoader)
                 except Exception:
-                    self._task.log.warning('Failed parsing task parameter %s=%s keeping default %s=%s' %
-                                           (str(k), str(param), str(k), str(v)))
+                    warn_failed_parsing()
+            elif issubclass(v_type, Enum):
+                # noinspection PyBroadException
+                try:
+                    param = getattr(v_type, param).value
+                except Exception:
+                    warn_failed_parsing()
+                    continue
 
             # noinspection PyBroadException
             try:
@@ -531,8 +583,7 @@ class _Arguments(object):
                 else:
                     dictionary[k] = None if param == '' else v_type(param)
             except Exception:
-                self._task.log.warning('Failed parsing task parameter %s=%s keeping default %s=%s' %
-                                       (str(k), str(param), str(k), str(v)))
+                warn_failed_parsing()
                 continue
         # add missing parameters to dictionary
         # for k, v in parameters.items():
@@ -542,6 +593,20 @@ class _Arguments(object):
         if not isinstance(dictionary, self._ProxyDictReadOnly):
             return self._ProxyDictReadOnly(self, prefix, **dictionary)
         return dictionary
+
+    @classmethod
+    def get_supported_types(cls, as_str=False):
+        # type: (bool) -> Union[Type, Tuple[str]]
+        """
+        Return the basic types supported by Argument casting
+        :param as_str: if True, return string cast of the types
+        :return: List of type objects supported for auto casting (serializing to string)
+        """
+        supported_types = (int, float, bool, str, list, tuple, Enum)
+        if as_str:
+            return tuple([str(t) for t in supported_types])
+
+        return supported_types
 
     @classmethod
     def __cast_arg(cls, arg, dtype=None):

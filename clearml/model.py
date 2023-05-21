@@ -2,26 +2,45 @@ import abc
 import os
 import tarfile
 import zipfile
+import shutil
 from tempfile import mkdtemp, mkstemp
 
 import six
-from typing import List, Dict, Union, Optional, Mapping, TYPE_CHECKING, Sequence
+import math
+from typing import List, Dict, Union, Optional, Mapping, TYPE_CHECKING, Sequence, Any, Tuple
+import numpy as np
+
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
 
 from .backend_api import Session
 from .backend_api.services import models, projects
 from pathlib2 import Path
 
 from .utilities.config import config_dict_to_text, text_to_config_dict
+from .utilities.proxy_object import cast_basic_type
+from .utilities.plotly_reporter import SeriesInfo
 
-from .backend_interface.util import validate_dict, get_single_result, mutually_exclusive, exact_match_regex
+from .backend_interface.util import (
+    validate_dict,
+    get_single_result,
+    mutually_exclusive,
+    exact_match_regex,
+    get_or_create_project,
+)
 from .debugging.log import get_logger
+from .errors import UsageError
 from .storage.cache import CacheManager
 from .storage.helper import StorageHelper
 from .storage.util import get_common_path
 from .utilities.enum import Options
 from .backend_interface import Task as _Task
 from .backend_interface.model import create_dummy_model, Model as _Model
+from .backend_interface.session import SendError
 from .config import running_remotely, get_cache_dir
+from .backend_interface.metrics import Reporter, Metrics
 
 
 if TYPE_CHECKING:
@@ -32,52 +51,91 @@ class Framework(Options):
     """
     Optional frameworks for output model
     """
-    tensorflow = 'TensorFlow'
-    tensorflowjs = 'TensorFlow_js'
-    tensorflowlite = 'TensorFlow_Lite'
-    pytorch = 'PyTorch'
-    caffe = 'Caffe'
-    caffe2 = 'Caffe2'
-    onnx = 'ONNX'
-    keras = 'Keras'
-    mknet = 'MXNet'
-    cntk = 'CNTK'
-    torch = 'Torch'
-    darknet = 'Darknet'
-    paddlepaddle = 'PaddlePaddle'
-    scikitlearn = 'ScikitLearn'
-    xgboost = 'XGBoost'
-    lightgbm = 'LightGBM'
-    parquet = 'Parquet'
+
+    tensorflow = "TensorFlow"
+    tensorflowjs = "TensorFlow_js"
+    tensorflowlite = "TensorFlow_Lite"
+    pytorch = "PyTorch"
+    torchscript = "TorchScript"
+    caffe = "Caffe"
+    caffe2 = "Caffe2"
+    onnx = "ONNX"
+    keras = "Keras"
+    mknet = "MXNet"
+    cntk = "CNTK"
+    torch = "Torch"
+    darknet = "Darknet"
+    paddlepaddle = "PaddlePaddle"
+    scikitlearn = "ScikitLearn"
+    xgboost = "XGBoost"
+    lightgbm = "LightGBM"
+    parquet = "Parquet"
+    megengine = "MegEngine"
+    catboost = "CatBoost"
+    tensorrt = "TensorRT"
+    openvino = "OpenVINO"
 
     __file_extensions_mapping = {
-        '.pb': (tensorflow, tensorflowjs, onnx, ),
-        '.meta': (tensorflow, ),
-        '.pbtxt': (tensorflow, onnx, ),
-        '.zip': (tensorflow, ),
-        '.tgz': (tensorflow, ),
-        '.tar.gz': (tensorflow, ),
-        'model.json': (tensorflowjs, ),
-        '.tflite': (tensorflowlite, ),
-        '.pth': (pytorch, ),
-        '.pt': (pytorch, ),
-        '.caffemodel': (caffe, ),
-        '.prototxt': (caffe, ),
-        'predict_net.pb': (caffe2, ),
-        'predict_net.pbtxt': (caffe2, ),
-        '.onnx': (onnx, ),
-        '.h5': (keras, ),
-        '.hdf5': (keras, ),
-        '.keras': (keras, ),
-        '.model': (mknet, cntk, xgboost),
-        '-symbol.json': (mknet, ),
-        '.cntk': (cntk, ),
-        '.t7': (torch, ),
-        '.cfg': (darknet, ),
-        '__model__': (paddlepaddle, ),
-        '.pkl': (scikitlearn, keras, xgboost),
-        '.parquet': (parquet, ),
+        ".pb": (
+            tensorflow,
+            tensorflowjs,
+            onnx,
+        ),
+        ".meta": (tensorflow,),
+        ".pbtxt": (
+            tensorflow,
+            onnx,
+        ),
+        ".zip": (tensorflow,),
+        ".tgz": (tensorflow,),
+        ".tar.gz": (tensorflow,),
+        "model.json": (tensorflowjs,),
+        ".tflite": (tensorflowlite,),
+        ".pth": (pytorch,),
+        ".pt": (pytorch,),
+        ".caffemodel": (caffe,),
+        ".prototxt": (caffe,),
+        "predict_net.pb": (caffe2,),
+        "predict_net.pbtxt": (caffe2,),
+        ".onnx": (onnx,),
+        ".h5": (keras,),
+        ".hdf5": (keras,),
+        ".keras": (keras,),
+        ".model": (mknet, cntk, xgboost),
+        "-symbol.json": (mknet,),
+        ".cntk": (cntk,),
+        ".t7": (torch,),
+        ".cfg": (darknet,),
+        "__model__": (paddlepaddle,),
+        ".pkl": (scikitlearn, keras, xgboost, megengine),
+        ".parquet": (parquet,),
+        ".cbm": (catboost,),
+        ".plan": (tensorrt,),
     }
+
+    __parent_mapping = {
+        "tensorflow": (
+            tensorflow,
+            tensorflowjs,
+            tensorflowlite,
+            keras,
+        ),
+        "pytorch": (pytorch,),
+        "xgboost": (xgboost,),
+        "lightgbm": (lightgbm,),
+        "catboost": (catboost,),
+        "joblib": (scikitlearn, xgboost),
+    }
+
+    @classmethod
+    def get_framework_parents(cls, framework):
+        if not framework:
+            return []
+        parents = []
+        for k, v in cls.__parent_mapping.items():
+            if framework in v:
+                parents.append(k)
+        return parents
 
     @classmethod
     def _get_file_ext(cls, framework, filename):
@@ -94,9 +152,14 @@ class Framework(Options):
         # If no framework, try finding first framework matching the extension, otherwise (or if no match) try matching
         # the given extension to the given framework. If no match return an empty extension
         return (
-            (not framework and find_framework_by_ext(lambda frameworks_: frameworks_[0]))
-            or find_framework_by_ext(lambda frameworks_: framework if framework in frameworks_ else None)
-            or (framework, filename.split('.')[-1] if '.' in filename else '')
+            (
+                not framework
+                and find_framework_by_ext(lambda frameworks_: frameworks_[0])
+            )
+            or find_framework_by_ext(
+                lambda frameworks_: framework if framework in frameworks_ else None
+            )
+            or (framework, filename.split(".")[-1] if "." in filename else "")
         )
 
 
@@ -110,7 +173,7 @@ class BaseModel(object):
     def id(self):
         # type: () -> str
         """
-        The Id (system UUID) of the model.
+        The ID (system UUID) of the model.
 
         :return: The model ID.
         """
@@ -135,6 +198,29 @@ class BaseModel(object):
         :param str value: The model name.
         """
         self._get_base_model().update(name=value)
+
+    @property
+    def project(self):
+        # type: () -> str
+        """
+        project ID of the model.
+
+        :return: project ID (str).
+        """
+        data = self._get_model_data()
+        return data.project
+
+    @project.setter
+    def project(self, value):
+        # type: (str) -> None
+        """
+        Set the project ID of the model.
+
+        :param value: project ID (str).
+
+        :type value: str
+        """
+        self._get_base_model().update(project_id=value)
 
     @property
     def comment(self):
@@ -187,7 +273,7 @@ class BaseModel(object):
         :return: The list of tags.
         """
         data = self._get_model_data()
-        return data.system_tags if Session.check_min_api_version('2.3') else data.tags
+        return data.system_tags if Session.check_min_api_version("2.3") else data.tags
 
     @system_tags.setter
     def system_tags(self, value):
@@ -269,23 +355,32 @@ class BaseModel(object):
         super(BaseModel, self).__init__()
         self._log = get_logger()
         self._task = None
+        self._reload_required = False
+        self._reporter = None
         self._set_task(task)
 
-    def get_weights(self, raise_on_error=False):
-        # type: (bool) -> str
+    def get_weights(self, raise_on_error=False, force_download=False):
+        # type: (bool, bool) -> str
         """
         Download the base model and return the locally stored filename.
 
-        :param bool raise_on_error: If True and the artifact could not be downloaded,
+        :param bool raise_on_error: If True, and the artifact could not be downloaded,
             raise ValueError, otherwise return None on failure and output log warning.
+
+        :param bool force_download: If True, the base model will be downloaded,
+            even if the base model is already cached.
 
         :return: The locally stored file.
         """
         # download model (synchronously) and return local file
-        return self._get_base_model().download_model_weights(raise_on_error=raise_on_error)
+        return self._get_base_model().download_model_weights(
+            raise_on_error=raise_on_error, force_download=force_download
+        )
 
-    def get_weights_package(self, return_path=False, raise_on_error=False):
-        # type: (bool, bool) -> Union[str, List[Path]]
+    def get_weights_package(
+        self, return_path=False, raise_on_error=False, force_download=False
+    ):
+        # type: (bool, bool, bool) -> Optional[Union[str, List[Path]]]
         """
         Download the base model package into a temporary directory (extract the files), or return a list of the
         locally stored filenames.
@@ -295,22 +390,37 @@ class BaseModel(object):
             - ``True`` - Download the model weights into a temporary directory, and return the temporary directory path.
             - ``False`` - Return a list of the locally stored filenames. (Default)
 
-        :param bool raise_on_error: If True and the artifact could not be downloaded,
+        :param bool raise_on_error: If True, and the artifact could not be downloaded,
             raise ValueError, otherwise return None on failure and output log warning.
 
+        :param bool force_download: If True, the base artifact will be downloaded,
+            even if the artifact is already cached.
+
         :return: The model weights, or a list of the locally stored filenames.
+            if raise_on_error=False, returns None on error.
         """
         # check if model was packaged
         if not self._is_package():
-            raise ValueError('Model is not packaged')
+            raise ValueError("Model is not packaged")
 
         # download packaged model
-        packed_file = self.get_weights(raise_on_error=raise_on_error)
+        packed_file = self.get_weights(
+            raise_on_error=raise_on_error, force_download=force_download
+        )
+
+        if not packed_file:
+            if raise_on_error:
+                raise ValueError(
+                    "Model package '{}' could not be downloaded".format(self.url)
+                )
+            return None
 
         # unpack
-        target_folder = mkdtemp(prefix='model_package_')
+        target_folder = mkdtemp(prefix="model_package_")
         if not target_folder:
-            raise ValueError('cannot create temporary directory for packed weight files')
+            raise ValueError(
+                "cannot create temporary directory for packed weight files"
+            )
 
         for func in (zipfile.ZipFile, tarfile.open):
             try:
@@ -320,13 +430,617 @@ class BaseModel(object):
             except (zipfile.BadZipfile, tarfile.ReadError):
                 pass
         else:
-            raise ValueError('cannot extract files from packaged model at %s', packed_file)
+            raise ValueError(
+                "cannot extract files from packaged model at %s", packed_file
+            )
 
         if return_path:
             return target_folder
 
-        target_files = list(Path(target_folder).glob('*'))
+        target_files = list(Path(target_folder).glob("*"))
         return target_files
+
+    def report_scalar(self, title, series, value, iteration):
+        # type: (str, str, float, int) -> None
+        """
+        For explicit reporting, plot a scalar series.
+
+        :param str title: The title (metric) of the plot. Plot more than one scalar series on the same plot by using
+            the same ``title`` for each call to this method.
+        :param str series: The series name (variant) of the reported scalar.
+        :param float value: The value to plot per iteration.
+        :param int iteration: The reported iteration / step (x-axis of the reported time series)
+        """
+        self._init_reporter()
+        return self._reporter.report_scalar(title=title, series=series, value=float(value), iter=iteration)
+
+    def report_single_value(self, name, value):
+        # type: (str, float) -> None
+        """
+        Reports a single value metric (for example, total experiment accuracy or mAP)
+
+        :param name: Metric's name
+        :param value: Metric's value
+        """
+        self._init_reporter()
+        return self._reporter.report_scalar(title="Summary", series=name, value=float(value), iter=-2**31)
+
+    def report_histogram(
+            self,
+            title,  # type: str
+            series,  # type: str
+            values,  # type: Sequence[Union[int, float]]
+            iteration=None,  # type: Optional[int]
+            labels=None,  # type: Optional[List[str]]
+            xlabels=None,  # type: Optional[List[str]]
+            xaxis=None,  # type: Optional[str]
+            yaxis=None,  # type: Optional[str]
+            mode=None,  # type: Optional[str]
+            data_args=None,  # type: Optional[dict]
+            extra_layout=None  # type: Optional[dict]
+    ):
+        """
+        For explicit reporting, plot a (default grouped) histogram.
+        Notice this function will not calculate the histogram,
+        it assumes the histogram was already calculated in `values`
+
+        For example:
+
+        .. code-block:: py
+
+           vector_series = np.random.randint(10, size=10).reshape(2,5)
+           model.report_histogram(title='histogram example', series='histogram series',
+                values=vector_series, iteration=0, labels=['A','B'], xaxis='X axis label', yaxis='Y axis label')
+
+        :param title: The title (metric) of the plot.
+        :param series: The series name (variant) of the reported histogram.
+        :param values: The series values. A list of floats, or an N-dimensional Numpy array containing
+            data for each histogram bar.
+        :param iteration: The reported iteration / step. Each ``iteration`` creates another plot.
+        :param labels: Labels for each bar group, creating a plot legend labeling each series. (Optional)
+        :param xlabels: Labels per entry in each bucket in the histogram (vector), creating a set of labels
+            for each histogram bar on the x-axis. (Optional)
+        :param xaxis: The x-axis title. (Optional)
+        :param yaxis: The y-axis title. (Optional)
+        :param mode: Multiple histograms mode, stack / group / relative. Default is 'group'.
+        :param data_args: optional dictionary for data configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/bar/
+            example: data_args={'orientation': 'h', 'marker': {'color': 'blue'}}
+        :param extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/bar/
+            example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
+        """
+        self._init_reporter()
+
+        if not isinstance(values, np.ndarray):
+            values = np.array(values)
+
+        return self._reporter.report_histogram(
+            title=title,
+            series=series,
+            histogram=values,
+            iter=iteration or 0,
+            labels=labels,
+            xlabels=xlabels,
+            xtitle=xaxis,
+            ytitle=yaxis,
+            mode=mode or "group",
+            data_args=data_args,
+            layout_config=extra_layout
+        )
+
+    def report_vector(
+            self,
+            title,  # type: str
+            series,  # type: str
+            values,  # type: Sequence[Union[int, float]]
+            iteration=None,  # type: Optional[int]
+            labels=None,  # type: Optional[List[str]]
+            xlabels=None,  # type: Optional[List[str]]
+            xaxis=None,  # type: Optional[str]
+            yaxis=None,  # type: Optional[str]
+            mode=None,  # type: Optional[str]
+            extra_layout=None  # type: Optional[dict]
+    ):
+        """
+        For explicit reporting, plot a vector as (default stacked) histogram.
+
+        For example:
+
+        .. code-block:: py
+
+           vector_series = np.random.randint(10, size=10).reshape(2,5)
+           model.report_vector(title='vector example', series='vector series', values=vector_series, iteration=0,
+                labels=['A','B'], xaxis='X axis label', yaxis='Y axis label')
+
+        :param title: The title (metric) of the plot.
+        :param series: The series name (variant) of the reported histogram.
+        :param values: The series values. A list of floats, or an N-dimensional Numpy array containing
+            data for each histogram bar.
+        :param iteration: The reported iteration / step. Each ``iteration`` creates another plot.
+        :param labels: Labels for each bar group, creating a plot legend labeling each series. (Optional)
+        :param xlabels: Labels per entry in each bucket in the histogram (vector), creating a set of labels
+            for each histogram bar on the x-axis. (Optional)
+        :param xaxis: The x-axis title. (Optional)
+        :param yaxis: The y-axis title. (Optional)
+        :param mode: Multiple histograms mode, stack / group / relative. Default is 'group'.
+        :param extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/layout/
+            example: extra_layout={'showlegend': False, 'plot_bgcolor': 'yellow'}
+        """
+        self._init_reporter()
+        return self.report_histogram(
+            title,
+            series,
+            values,
+            iteration or 0,
+            labels=labels,
+            xlabels=xlabels,
+            xaxis=xaxis,
+            yaxis=yaxis,
+            mode=mode,
+            extra_layout=extra_layout,
+        )
+
+    def report_table(
+            self,
+            title,  # type: str
+            series,  # type: str
+            iteration=None,  # type: Optional[int]
+            table_plot=None,  # type: Optional[pd.DataFrame, Sequence[Sequence]]
+            csv=None,  # type: Optional[str]
+            url=None,  # type: Optional[str]
+            extra_layout=None  # type: Optional[dict]
+    ):
+        """
+        For explicit report, report a table plot.
+
+        One and only one of the following parameters must be provided.
+
+        - ``table_plot`` - Pandas DataFrame or Table as list of rows (list)
+        - ``csv`` - CSV file
+        - ``url`` - URL to CSV file
+
+        For example:
+
+        .. code-block:: py
+
+           df = pd.DataFrame({'num_legs': [2, 4, 8, 0],
+                   'num_wings': [2, 0, 0, 0],
+                   'num_specimen_seen': [10, 2, 1, 8]},
+                   index=['falcon', 'dog', 'spider', 'fish'])
+
+           model.report_table(title='table example',series='pandas DataFrame',iteration=0,table_plot=df)
+
+        :param title: The title (metric) of the table.
+        :param series: The series name (variant) of the reported table.
+        :param iteration: The reported iteration / step.
+        :param table_plot: The output table plot object
+        :param csv: path to local csv file
+        :param url: A URL to the location of csv file.
+        :param extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/layout/
+            example: extra_layout={'height': 600}
+        """
+        mutually_exclusive(
+            UsageError, _check_none=True,
+            table_plot=table_plot, csv=csv, url=url
+        )
+        table = table_plot
+        if url or csv:
+            if not pd:
+                raise UsageError(
+                    "pandas is required in order to support reporting tables using CSV or a URL, "
+                    "please install the pandas python package"
+                )
+            if url:
+                table = pd.read_csv(url, index_col=[0])
+            elif csv:
+                table = pd.read_csv(csv, index_col=[0])
+
+        def replace(dst, *srcs):
+            for src in srcs:
+                reporter_table.replace(src, dst, inplace=True)
+
+        if isinstance(table, (list, tuple)):
+            reporter_table = table
+        else:
+            reporter_table = table.fillna(str(np.nan))
+            replace("NaN", np.nan, math.nan if six.PY3 else float("nan"))
+            replace("Inf", np.inf, math.inf if six.PY3 else float("inf"))
+            replace("-Inf", -np.inf, np.NINF, -math.inf if six.PY3 else -float("inf"))
+        self._init_reporter()
+        return self._reporter.report_table(
+            title=title,
+            series=series,
+            table=reporter_table,
+            iteration=iteration or 0,
+            layout_config=extra_layout
+        )
+
+    def report_line_plot(
+            self,
+            title,  # type: str
+            series,  # type: Sequence[SeriesInfo]
+            xaxis,  # type: str
+            yaxis,  # type: str
+            mode="lines",  # type: str
+            iteration=None,  # type: Optional[int]
+            reverse_xaxis=False,  # type: bool
+            comment=None,  # type: Optional[str]
+            extra_layout=None  # type: Optional[dict]
+    ):
+        """
+        For explicit reporting, plot one or more series as lines.
+
+        :param str title: The title (metric) of the plot.
+        :param list series: All the series data, one list element for each line in the plot.
+        :param int iteration: The reported iteration / step.
+        :param str xaxis: The x-axis title. (Optional)
+        :param str yaxis: The y-axis title. (Optional)
+        :param str mode: The type of line plot. The values are:
+
+          - ``lines`` (default)
+          - ``markers``
+          - ``lines+markers``
+
+        :param bool reverse_xaxis: Reverse the x-axis. The values are:
+
+          - ``True`` - The x-axis is high to low  (reversed).
+          - ``False`` - The x-axis is low to high  (not reversed). (default)
+
+        :param str comment: A comment displayed with the plot, underneath the title.
+        :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/scatter/
+            example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
+        """
+        self._init_reporter()
+
+        # noinspection PyArgumentList
+        series = [SeriesInfo(**s) if isinstance(s, dict) else s for s in series]
+
+        return self._reporter.report_line_plot(
+            title=title,
+            series=series,
+            iter=iteration or 0,
+            xtitle=xaxis,
+            ytitle=yaxis,
+            mode=mode,
+            reverse_xaxis=reverse_xaxis,
+            comment=comment,
+            layout_config=extra_layout
+        )
+
+    def report_scatter2d(
+            self,
+            title,  # type: str
+            series,  # type: str
+            scatter,  # type: Union[Sequence[Tuple[float, float]], np.ndarray]
+            iteration=None,  # type: Optional[int]
+            xaxis=None,  # type: Optional[str]
+            yaxis=None,  # type: Optional[str]
+            labels=None,  # type: Optional[List[str]]
+            mode="line",  # type: str
+            comment=None,  # type: Optional[str]
+            extra_layout=None,  # type: Optional[dict]
+    ):
+        """
+        For explicit reporting, report a 2d scatter plot.
+
+        For example:
+
+        .. code-block:: py
+
+           scatter2d = np.hstack((np.atleast_2d(np.arange(0, 10)).T, np.random.randint(10, size=(10, 1))))
+           model.report_scatter2d(title="example_scatter", series="series", iteration=0, scatter=scatter2d,
+                xaxis="title x", yaxis="title y")
+
+        Plot multiple 2D scatter series on the same plot by passing the same ``title`` and ``iteration`` values
+        to this method:
+
+        .. code-block:: py
+
+           scatter2d_1 = np.hstack((np.atleast_2d(np.arange(0, 10)).T, np.random.randint(10, size=(10, 1))))
+           model.report_scatter2d(title="example_scatter", series="series_1", iteration=1, scatter=scatter2d_1,
+                xaxis="title x", yaxis="title y")
+
+           scatter2d_2 = np.hstack((np.atleast_2d(np.arange(0, 10)).T, np.random.randint(10, size=(10, 1))))
+           model.report_scatter2d("example_scatter", "series_2", iteration=1, scatter=scatter2d_2,
+                xaxis="title x", yaxis="title y")
+
+        :param str title: The title (metric) of the plot.
+        :param str series: The series name (variant) of the reported scatter plot.
+        :param list scatter: The scatter data. numpy.ndarray or list of (pairs of x,y) scatter:
+        :param int iteration: The reported iteration / step.
+        :param str xaxis: The x-axis title. (Optional)
+        :param str yaxis: The y-axis title. (Optional)
+        :param list(str) labels: Labels per point in the data assigned to the ``scatter`` parameter. The labels must be
+            in the same order as the data.
+        :param str mode: The type of scatter plot. The values are:
+
+          - ``lines``
+          - ``markers``
+          - ``lines+markers``
+
+        :param str comment: A comment displayed with the plot, underneath the title.
+        :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/scatter/
+            example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
+        """
+        self._init_reporter()
+
+        if not isinstance(scatter, np.ndarray):
+            if not isinstance(scatter, list):
+                scatter = list(scatter)
+            scatter = np.array(scatter)
+
+        return self._reporter.report_2d_scatter(
+            title=title,
+            series=series,
+            data=scatter,
+            iter=iteration or 0,
+            mode=mode,
+            xtitle=xaxis,
+            ytitle=yaxis,
+            labels=labels,
+            comment=comment,
+            layout_config=extra_layout,
+        )
+
+    def report_scatter3d(
+            self,
+            title,  # type: str
+            series,  # type: str
+            scatter,  # type: Union[Sequence[Tuple[float, float, float]], np.ndarray]
+            iteration=None,  # type: Optional[int]
+            xaxis=None,  # type: Optional[str]
+            yaxis=None,  # type: Optional[str]
+            zaxis=None,  # type: Optional[str]
+            labels=None,  # type: Optional[List[str]]
+            mode="markers",  # type: str
+            fill=False,  # type: bool
+            comment=None,  # type: Optional[str]
+            extra_layout=None  # type: Optional[dict]
+    ):
+        """
+        For explicit reporting, plot a 3d scatter graph (with markers).
+
+        :param str title: The title (metric) of the plot.
+        :param str series: The series name (variant) of the reported scatter plot.
+        :param Union[numpy.ndarray, list] scatter: The scatter data.
+            list of (pairs of x,y,z), list of series [[(x1,y1,z1)...]], or numpy.ndarray
+        :param int iteration: The reported iteration / step.
+        :param str xaxis: The x-axis title. (Optional)
+        :param str yaxis: The y-axis title. (Optional)
+        :param str zaxis: The z-axis title. (Optional)
+        :param list(str) labels: Labels per point in the data assigned to the ``scatter`` parameter. The labels must be
+            in the same order as the data.
+        :param str mode: The type of scatter plot. The values are: ``lines``, ``markers``, ``lines+markers``.
+
+            For example:
+
+            .. code-block:: py
+
+               scatter3d = np.random.randint(10, size=(10, 3))
+               model.report_scatter3d(title="example_scatter_3d", series="series_xyz", iteration=1, scatter=scatter3d,
+                   xaxis="title x", yaxis="title y", zaxis="title z")
+
+        :param bool fill: Fill the area under the curve. The values are:
+
+          - ``True`` - Fill
+          - ``False`` - Do not fill (default)
+
+        :param str comment: A comment displayed with the plot, underneath the title.
+        :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/scatter3d/
+            example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
+        """
+        self._init_reporter()
+
+        # check if multiple series
+        multi_series = (
+            isinstance(scatter, list)
+            and (
+                isinstance(scatter[0], np.ndarray)
+                or (
+                    scatter[0]
+                    and isinstance(scatter[0], list)
+                    and isinstance(scatter[0][0], list)
+                )
+            )
+        )
+
+        if not multi_series:
+            if not isinstance(scatter, np.ndarray):
+                if not isinstance(scatter, list):
+                    scatter = list(scatter)
+                scatter = np.array(scatter)
+            try:
+                scatter = scatter.astype(np.float32)
+            except ValueError:
+                pass
+
+        return self._reporter.report_3d_scatter(
+            title=title,
+            series=series,
+            data=scatter,
+            iter=iteration or 0,
+            labels=labels,
+            mode=mode,
+            fill=fill,
+            comment=comment,
+            xtitle=xaxis,
+            ytitle=yaxis,
+            ztitle=zaxis,
+            layout_config=extra_layout
+        )
+
+    def report_confusion_matrix(
+            self,
+            title,  # type: str
+            series,  # type: str
+            matrix,  # type: np.ndarray
+            iteration=None,  # type: Optional[int]
+            xaxis=None,  # type: Optional[str]
+            yaxis=None,  # type: Optional[str]
+            xlabels=None,  # type: Optional[List[str]]
+            ylabels=None,  # type: Optional[List[str]]
+            yaxis_reversed=False,  # type: bool
+            comment=None,  # type: Optional[str]
+            extra_layout=None  # type: Optional[dict]
+    ):
+        """
+        For explicit reporting, plot a heat-map matrix.
+
+        For example:
+
+        .. code-block:: py
+
+           confusion = np.random.randint(10, size=(10, 10))
+           model.report_confusion_matrix("example confusion matrix", "ignored", iteration=1, matrix=confusion,
+                xaxis="title X", yaxis="title Y")
+
+        :param str title: The title (metric) of the plot.
+        :param str series: The series name (variant) of the reported confusion matrix.
+        :param numpy.ndarray matrix: A heat-map matrix (example: confusion matrix)
+        :param int iteration: The reported iteration / step.
+        :param str xaxis: The x-axis title. (Optional)
+        :param str yaxis: The y-axis title. (Optional)
+        :param list(str) xlabels: Labels for each column of the matrix. (Optional)
+        :param list(str) ylabels: Labels for each row of the matrix. (Optional)
+        :param bool yaxis_reversed: If False 0,0 is at the bottom left corner. If True, 0,0 is at the top left corner
+        :param str comment: A comment displayed with the plot, underneath the title.
+        :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/heatmap/
+            example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
+        """
+        self._init_reporter()
+
+        if not isinstance(matrix, np.ndarray):
+            matrix = np.array(matrix)
+
+        return self._reporter.report_value_matrix(
+            title=title,
+            series=series,
+            data=matrix.astype(np.float32),
+            iter=iteration or 0,
+            xtitle=xaxis,
+            ytitle=yaxis,
+            xlabels=xlabels,
+            ylabels=ylabels,
+            yaxis_reversed=yaxis_reversed,
+            comment=comment,
+            layout_config=extra_layout
+        )
+
+    def report_matrix(
+            self,
+            title,  # type: str
+            series,  # type: str
+            matrix,  # type: np.ndarray
+            iteration=None,  # type: Optional[int]
+            xaxis=None,  # type: Optional[str]
+            yaxis=None,  # type: Optional[str]
+            xlabels=None,  # type: Optional[List[str]]
+            ylabels=None,  # type: Optional[List[str]]
+            yaxis_reversed=False,  # type: bool
+            extra_layout=None  # type: Optional[dict]
+    ):
+        """
+        For explicit reporting, plot a confusion matrix.
+
+        .. note::
+            This method is the same as :meth:`Model.report_confusion_matrix`.
+
+        :param str title: The title (metric) of the plot.
+        :param str series: The series name (variant) of the reported confusion matrix.
+        :param numpy.ndarray matrix: A heat-map matrix (example: confusion matrix)
+        :param int iteration: The reported iteration / step.
+        :param str xaxis: The x-axis title. (Optional)
+        :param str yaxis: The y-axis title. (Optional)
+        :param list(str) xlabels: Labels for each column of the matrix. (Optional)
+        :param list(str) ylabels: Labels for each row of the matrix. (Optional)
+        :param bool yaxis_reversed: If False, 0,0 is at the bottom left corner. If True, 0,0 is at the top left corner
+        :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/heatmap/
+            example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
+        """
+        self._init_reporter()
+        return self.report_confusion_matrix(
+            title,
+            series,
+            matrix,
+            iteration or 0,
+            xaxis=xaxis,
+            yaxis=yaxis,
+            xlabels=xlabels,
+            ylabels=ylabels,
+            yaxis_reversed=yaxis_reversed,
+            extra_layout=extra_layout
+        )
+
+    def report_surface(
+            self,
+            title,  # type: str
+            series,  # type: str
+            matrix,  # type: np.ndarray
+            iteration=None,  # type: Optional[int]
+            xaxis=None,  # type: Optional[str]
+            yaxis=None,  # type: Optional[str]
+            zaxis=None,  # type: Optional[str]
+            xlabels=None,  # type: Optional[List[str]]
+            ylabels=None,  # type: Optional[List[str]]
+            camera=None,  # type: Optional[Sequence[float]]
+            comment=None,  # type: Optional[str]
+            extra_layout=None  # type: Optional[dict]
+    ):
+        """
+        For explicit reporting, report a 3d surface plot.
+
+        .. note::
+           This method plots the same data as :meth:`Model.report_confusion_matrix`, but presents the
+           data as a surface diagram not a confusion matrix.
+
+        .. code-block:: py
+
+           surface_matrix = np.random.randint(10, size=(10, 10))
+           model.report_surface("example surface", "series", iteration=0, matrix=surface_matrix,
+                xaxis="title X", yaxis="title Y", zaxis="title Z")
+
+        :param str title: The title (metric) of the plot.
+        :param str series: The series name (variant) of the reported surface.
+        :param numpy.ndarray matrix: A heat-map matrix (example: confusion matrix)
+        :param int iteration: The reported iteration / step.
+        :param str xaxis: The x-axis title. (Optional)
+        :param str yaxis: The y-axis title. (Optional)
+        :param str zaxis: The z-axis title. (Optional)
+        :param list(str) xlabels: Labels for each column of the matrix. (Optional)
+        :param list(str) ylabels: Labels for each row of the matrix. (Optional)
+        :param list(float) camera: X,Y,Z coordinates indicating the camera position. The default value is ``(1,1,1)``.
+        :param str comment: A comment displayed with the plot, underneath the title.
+        :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/surface/
+            example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
+        """
+        self._init_reporter()
+
+        if not isinstance(matrix, np.ndarray):
+            matrix = np.array(matrix)
+
+        return self._reporter.report_value_surface(
+            title=title,
+            series=series,
+            data=matrix.astype(np.float32),
+            iter=iteration or 0,
+            xlabels=xlabels,
+            ylabels=ylabels,
+            xtitle=xaxis,
+            ytitle=yaxis,
+            ztitle=zaxis,
+            camera=camera,
+            comment=comment,
+            layout_config=extra_layout
+        )
 
     def publish(self):
         # type: () -> ()
@@ -338,6 +1052,17 @@ class BaseModel(object):
         if not self.published:
             self._get_base_model().publish()
 
+    def _init_reporter(self):
+        if self._reporter:
+            return
+        metrics_manager = Metrics(
+            session=_Model._get_default_session(),
+            storage_uri=None,
+            task=self,  # this is fine, the ID of the model will be fetched here
+            for_model=True
+        )
+        self._reporter = Reporter(metrics=metrics_manager, task=self, for_model=True)
+
     def _running_remotely(self):
         # type: () -> ()
         return bool(running_remotely() and self._task is not None)
@@ -345,7 +1070,7 @@ class BaseModel(object):
     def _set_task(self, value):
         # type: (_Task) -> ()
         if value is not None and not isinstance(value, _Task):
-            raise ValueError('task argument must be of Task type')
+            raise ValueError("task argument must be of Task type")
         self._task = value
 
     @abc.abstractmethod
@@ -367,7 +1092,9 @@ class BaseModel(object):
     @staticmethod
     def _config_dict_to_text(config):
         if not isinstance(config, six.string_types) and not isinstance(config, dict):
-            raise ValueError("Model configuration only supports dictionary or string objects")
+            raise ValueError(
+                "Model configuration only supports dictionary or string objects"
+            )
         return config_dict_to_text(config)
 
     @staticmethod
@@ -378,11 +1105,149 @@ class BaseModel(object):
 
     @staticmethod
     def _resolve_config(config_text=None, config_dict=None):
-        mutually_exclusive(config_text=config_text, config_dict=config_dict, _require_at_least_one=False)
+        mutually_exclusive(
+            config_text=config_text,
+            config_dict=config_dict,
+            _require_at_least_one=False,
+        )
         if config_dict:
             return InputModel._config_dict_to_text(config_dict)
 
         return config_text
+
+    def set_metadata(self, key, value, v_type=None):
+        # type: (str, str, Optional[str]) -> bool
+        """
+        Set one metadata entry. All parameters must be strings or castable to strings
+
+        :param key: Key of the metadata entry
+        :param value: Value of the metadata entry
+        :param v_type: Type of the metadata entry
+
+        :return: True if the metadata was set and False otherwise
+        """
+        self._reload_required = (
+            _Model._get_default_session()
+            .send(
+                models.AddOrUpdateMetadataRequest(
+                    metadata=[
+                        {
+                            "key": str(key),
+                            "value": str(value),
+                            "type": str(v_type)
+                            if str(v_type)
+                            in (
+                                "float",
+                                "int",
+                                "bool",
+                                "str",
+                                "basestring",
+                                "list",
+                                "tuple",
+                                "dict",
+                            )
+                            else str(None),
+                        }
+                    ],
+                    model=self.id,
+                    replace_metadata=False,
+                )
+            )
+            .ok()
+        )
+        return self._reload_required
+
+    def get_metadata(self, key):
+        # type: (str) -> Optional[str]
+        """
+        Get one metadata entry value (as a string) based on its key. See `Model.get_metadata_casted`
+        if you wish to cast the value to its type (if possible)
+
+        :param key: Key of the metadata entry you want to get
+
+        :return: String representation of the value of the metadata entry or None if the entry was not found
+        """
+        self._reload_if_required()
+        return self.get_all_metadata().get(str(key), {}).get("value")
+
+    def get_metadata_casted(self, key):
+        # type: (str) -> Optional[str]
+        """
+        Get one metadata entry based on its key, casted to its type if possible
+
+        :param key: Key of the metadata entry you want to get
+
+        :return: The value of the metadata entry, casted to its type (if not possible,
+            the string representation will be returned) or None if the entry was not found
+        """
+        key = str(key)
+        metadata = self.get_all_metadata()
+        if key not in metadata:
+            return None
+        return cast_basic_type(metadata[key].get("value"), metadata[key].get("type"))
+
+    def get_all_metadata(self):
+        # type: () -> Dict[str, Dict[str, str]]
+        """
+        See `Model.get_all_metadata_casted` if you wish to cast the value to its type (if possible)
+
+        :return: Get all metadata as a dictionary of format Dict[key, Dict[value, type]]. The key, value and type
+            entries are all strings. Note that each entry might have an additional 'key' entry, repeating the key
+        """
+        self._reload_if_required()
+        return self._get_model_data().metadata or {}
+
+    def get_all_metadata_casted(self):
+        # type: () -> Dict[str, Dict[str, Any]]
+        """
+        :return: Get all metadata as a dictionary of format Dict[key, Dict[value, type]]. The key and type
+            entries are strings. The value is cast to its type if possible. Note that each entry might
+            have an additional 'key' entry, repeating the key
+        """
+        self._reload_if_required()
+        result = {}
+        metadata = self.get_all_metadata()
+        for key, metadata_entry in metadata.items():
+            result[key] = cast_basic_type(
+                metadata_entry.get("value"), metadata_entry.get("type")
+            )
+        return result
+
+    def set_all_metadata(self, metadata, replace=True):
+        # type: (Dict[str, Dict[str, str]], bool) -> bool
+        """
+        Set metadata based on the given parameters. Allows replacing all entries or updating the current entries.
+
+        :param metadata: A dictionary of format Dict[key, Dict[value, type]] representing the metadata you want to set
+        :param replace: If True, replace all metadata with the entries in the `metadata` parameter. If False,
+            keep the old metadata and update it with the entries in the `metadata` parameter (add or change it)
+
+        :return: True if the metadata was set and False otherwise
+        """
+        metadata_array = [
+            {
+                "key": str(k),
+                "value": str(v_t.get("value")),
+                "type": str(v_t.get("type")),
+            }
+            for k, v_t in metadata.items()
+        ]
+        self._reload_required = (
+            _Model._get_default_session()
+            .send(
+                models.AddOrUpdateMetadataRequest(
+                    metadata=metadata_array, model=self.id, replace_metadata=replace
+                )
+            )
+            .ok()
+        )
+        return self._reload_required
+
+    def _reload_if_required(self):
+        if not self._reload_required:
+            return
+        self._get_base_model().reload()
+        self._reload_required = False
 
 
 class Model(BaseModel):
@@ -398,30 +1263,40 @@ class Model(BaseModel):
 
         Notice, we can override the input model when running remotely
 
-        :param model_id: id (string)
+        :param model_id: ID (string)
         """
         super(Model, self).__init__()
         self._base_model_id = model_id
         self._base_model = None
 
-    def get_local_copy(self, extract_archive=True, raise_on_error=False):
-        # type: (bool, bool) -> str
+    def get_local_copy(
+        self, extract_archive=True, raise_on_error=False, force_download=False
+    ):
+        # type: (bool, bool, bool) -> str
         """
         Retrieve a valid link to the model file(s).
         If the model URL is a file system link, it will be returned directly.
-        If the model URL is points to a remote location (http/s3/gs etc.),
+        If the model URL points to a remote location (http/s3/gs etc.),
         it will download the file(s) and return the temporary location of the downloaded model.
 
-        :param bool extract_archive: If True and the model is of type 'packaged' (e.g. TensorFlow compressed folder)
+        :param bool extract_archive: If True, and the model is of type 'packaged' (e.g. TensorFlow compressed folder)
             The returned path will be a temporary folder containing the archive content
-        :param bool raise_on_error: If True and the artifact could not be downloaded,
+        :param bool raise_on_error: If True, and the artifact could not be downloaded,
             raise ValueError, otherwise return None on failure and output log warning.
+        :param bool force_download: If True, the artifact will be downloaded,
+            even if the model artifact is already cached.
 
         :return: A local path to the model (or a downloaded copy of it).
         """
         if extract_archive and self._is_package():
-            return self.get_weights_package(return_path=True, raise_on_error=raise_on_error)
-        return self.get_weights(raise_on_error=raise_on_error)
+            return self.get_weights_package(
+                return_path=True,
+                raise_on_error=raise_on_error,
+                force_download=force_download,
+            )
+        return self.get_weights(
+            raise_on_error=raise_on_error, force_download=force_download
+        )
 
     def _get_base_model(self):
         if self._base_model:
@@ -429,7 +1304,7 @@ class Model(BaseModel):
 
         if not self._base_model_id:
             # this shouldn't actually happen
-            raise Exception('Missing model ID, cannot create an empty model')
+            raise Exception("Missing model ID, cannot create an empty model")
         self._base_model = _Model(
             upload_storage_uri=None,
             cache_dir=get_cache_dir(),
@@ -442,13 +1317,14 @@ class Model(BaseModel):
 
     @classmethod
     def query_models(
-            cls,
-            project_name=None,  # type: Optional[str]
-            model_name=None,  # type: Optional[str]
-            tags=None,  # type: Optional[Sequence[str]]
-            only_published=False,  # type: bool
-            include_archived=False,  # type: bool
-            max_results=None,  # type: Optional[int]
+        cls,
+        project_name=None,  # type: Optional[str]
+        model_name=None,  # type: Optional[str]
+        tags=None,  # type: Optional[Sequence[str]]
+        only_published=False,  # type: bool
+        include_archived=False,  # type: bool
+        max_results=None,  # type: Optional[int]
+        metadata=None,  # type: Optional[Dict[str, str]]
     ):
         # type: (...) -> List[Model]
         """
@@ -458,12 +1334,18 @@ class Model(BaseModel):
 
         :param project_name: Optional, filter based project name string, if not given query models from all projects
         :param model_name: Optional Model name as shown in the model artifactory
-        :param tags: Optional filter models based on list of tags, example: ['production', 'verified', '-qa']
-            Notice use '-' prefix to filter out tags.
-        :param only_published: If True only return published models.
-        :param include_archived: If True return archived models.
+        :param tags: Filter based on the requested list of tags (strings)
+            To exclude a tag add "-" prefix to the tag. Example: ['production', 'verified', '-qa']
+            To include All tags (instead of the default Any behaviour) use "__$all" as the first string, example:
+            ["__$all", "best", "model", "ever"]
+            To combine All tags and exclude a list of tags use "__$not" before the excluded tags, example:
+            ["__$all", "best", "model", "ever", "__$not", "internal", "__$not", "test"]
+        :param only_published: If True, only return published models.
+        :param include_archived: If True, return archived models.
         :param max_results: Optional return the last X models,
             sorted by last update time (from the most recent to the least).
+        :param metadata: Filter based on metadata. This parameter is a dictionary. Notice that the type of the
+            metadata field is not required.
 
         :return: ModeList of Models objects
         """
@@ -472,44 +1354,150 @@ class Model(BaseModel):
             res = _Model._get_default_session().send(
                 projects.GetAllRequest(
                     name=exact_match_regex(project_name),
-                    only_fields=['id', 'name', 'last_update']
+                    only_fields=["id", "name", "last_update"],
                 )
             )
-            project = get_single_result(entity='project', query=project_name, results=res.response.projects)
+            project = get_single_result(
+                entity="project", query=project_name, results=res.response.projects
+            )
         else:
             project = None
 
-        only_fields = ['id', 'created', 'system_tags']
+        only_fields = ["id", "created", "system_tags"]
 
-        # noinspection PyProtectedMember
-        res = _Model._get_default_session().send(
-            models.GetAllRequest(
-                project=[project.id] if project else None,
-                name=model_name or None,
-                only_fields=only_fields,
-                tags=tags or None,
-                system_tags=["-" + cls._archived_tag] if not include_archived else None,
-                ready=True if only_published else None,
-                order_by=['-created'],
-                page=0 if max_results else None,
-                page_size=max_results or None,
+        extra_fields = {
+            "metadata.{}.value".format(k): v for k, v in (metadata or {}).items()
+        }
+
+        models_fetched = []
+
+        page = 0
+        page_size = 500
+        results_left = max_results if max_results is not None else float("inf")
+        while True:
+            # noinspection PyProtectedMember
+            res = _Model._get_default_session().send(
+                models.GetAllRequest(
+                    project=[project.id] if project else None,
+                    name=exact_match_regex(model_name)
+                    if model_name is not None
+                    else None,
+                    only_fields=only_fields,
+                    tags=tags or None,
+                    system_tags=["-" + cls._archived_tag]
+                    if not include_archived
+                    else None,
+                    ready=True if only_published else None,
+                    order_by=["-created"],
+                    page=page,
+                    page_size=page_size if results_left > page_size else results_left,
+                    _allow_extra_fields_=True,
+                    **extra_fields
+                )
             )
-        )
-        if not res.response.models:
-            return []
+            if not res.response.models:
+                break
+            models_fetched.extend(res.response.models)
+            results_left -= len(res.response.models)
+            if results_left <= 0 or len(res.response.models) < page_size:
+                break
 
-        return [Model(model_id=m.id) for m in res.response.models]
+            page += 1
+
+        return [Model(model_id=m.id) for m in models_fetched]
 
     @property
     def id(self):
         # type: () -> str
         return self._base_model_id if self._base_model_id else super(Model, self).id
 
+    @classmethod
+    def remove(
+        cls, model, delete_weights_file=True, force=False, raise_on_errors=False
+    ):
+        # type: (Union[str, Model], bool, bool, bool) -> bool
+        """
+        Remove a model from the model repository.
+        Optional, delete the model weights file from the remote storage.
+
+        :param model: Model ID or Model object to remove
+        :param delete_weights_file: If True (default), delete the weights file from the remote storage
+        :param force: If True, remove model even if other Tasks are using this model. default False.
+        :param raise_on_errors: If True, throw ValueError if something went wrong, default False.
+        :return: True if Model was removed successfully
+            partial removal returns False, i.e. Model was deleted but weights file deletion failed
+        """
+        if isinstance(model, str):
+            model = Model(model_id=model)
+
+        # noinspection PyBroadException
+        try:
+            weights_url = model.url
+        except Exception:
+            if raise_on_errors:
+                raise ValueError("Could not find model id={}".format(model.id))
+            return False
+
+        try:
+            # noinspection PyProtectedMember
+            res = _Model._get_default_session().send(
+                models.DeleteRequest(model.id, force=force),
+            )
+            response = res.wait()
+            if not response.ok():
+                if raise_on_errors:
+                    raise ValueError(
+                        "Could not remove model id={}: {}".format(
+                            model.id, response.meta
+                        )
+                    )
+                return False
+        except SendError as ex:
+            if raise_on_errors:
+                raise ValueError(
+                    "Could not remove model id={}: {}".format(model.id, ex)
+                )
+            return False
+        except ValueError:
+            if raise_on_errors:
+                raise
+            return False
+        except Exception as ex:
+            if raise_on_errors:
+                raise ValueError(
+                    "Could not remove model id={}: {}".format(model.id, ex)
+                )
+            return False
+
+        if not delete_weights_file:
+            return True
+
+        helper = StorageHelper.get(url=weights_url)
+        try:
+            if not helper.delete(weights_url):
+                if raise_on_errors:
+                    raise ValueError(
+                        "Could not remove model id={} weights file: {}".format(
+                            model.id, weights_url
+                        )
+                    )
+                return False
+        except Exception as ex:
+            if raise_on_errors:
+                raise ValueError(
+                    "Could not remove model id={} weights file '{}': {}".format(
+                        model.id, weights_url, ex
+                    )
+                )
+            return False
+
+        return True
+
 
 class InputModel(Model):
     """
-    Load an existing model in the system, search by model id.
-    The Model will be read-only and can be used to pre initialize a network
+    Load an existing model in the system, search by model ID.
+    The Model will be read-only and can be used to pre initialize a network.
     We can connect the model to a task as input model, then when running remotely override it with the UI.
     """
 
@@ -524,6 +1512,7 @@ class InputModel(Model):
         config_dict=None,  # type: Optional[dict]
         label_enumeration=None,  # type: Optional[Mapping[str, int]]
         name=None,  # type: Optional[str]
+        project=None,  # type: Optional[str]
         tags=None,  # type: Optional[List[str]]
         comment=None,  # type: Optional[str]
         is_package=False,  # type: bool
@@ -532,7 +1521,7 @@ class InputModel(Model):
     ):
         # type: (...) -> InputModel
         """
-        Create an InputModel object from a pre-trained model by specifying the URL of an initial weight files.
+        Create an InputModel object from a pre-trained model by specifying the URL of an initial weight file.
         Optionally, input a configuration, label enumeration, name for the model, tags describing the model,
         comment as a description of the model, indicate whether the model is a package, specify the model's
         framework, and indicate whether to immediately set the model's status to ``Published``.
@@ -553,13 +1542,11 @@ class InputModel(Model):
 
         :param str weights_url: A valid URL for the initial weights file. If the **ClearML Web-App** (backend)
             already stores the metadata of a model with the same URL, that existing model is returned
-            and ClearML ignores all other parameters.
+            and ClearML ignores all other parameters. For example:
 
-            For example:
-
-            - ``https://domain.com/file.bin``
-            - ``s3://bucket/file.bin``
-            - ``file:///home/user/file.bin``
+          - ``https://domain.com/file.bin``
+          - ``s3://bucket/file.bin``
+          - ``file:///home/user/file.bin``
 
         :param str config_text: The configuration as a string. This is usually the content of a configuration
             dictionary file. Specify ``config_text`` or ``config_dict``, but not both.
@@ -573,10 +1560,11 @@ class InputModel(Model):
             .. code-block:: javascript
 
                {
-                    'background': 0,
-                    'person': 1
+                    "background": 0,
+                    "person": 1
                }
         :param str name: The name of the newly imported model. (Optional)
+        :param str project: The project name to add the model into. (Optional)
         :param tags: The list of tags which describe the model. (Optional)
         :type tags: list(str)
         :param str comment: A comment / description for the model. (Optional)
@@ -597,29 +1585,36 @@ class InputModel(Model):
 
         :return: The imported model or existing model (see above).
         """
-        config_text = cls._resolve_config(config_text=config_text, config_dict=config_dict)
+        config_text = cls._resolve_config(
+            config_text=config_text, config_dict=config_dict
+        )
         weights_url = StorageHelper.conform_url(weights_url)
         if not weights_url:
             raise ValueError("Please provide a valid weights_url parameter")
         # convert local to file to remote one
         weights_url = CacheManager.get_remote_url(weights_url)
 
-        extra = {'system_tags': ["-" + cls._archived_tag]} \
-            if Session.check_min_api_version('2.3') else {'tags': ["-" + cls._archived_tag]}
+        extra = (
+            {"system_tags": ["-" + cls._archived_tag]}
+            if Session.check_min_api_version("2.3")
+            else {"tags": ["-" + cls._archived_tag]}
+        )
         # noinspection PyProtectedMember
-        result = _Model._get_default_session().send(models.GetAllRequest(
-            uri=[weights_url],
-            only_fields=["id", "name", "created"],
-            **extra
-        ))
+        result = _Model._get_default_session().send(
+            models.GetAllRequest(
+                uri=[weights_url], only_fields=["id", "name", "created"], **extra
+            )
+        )
 
         if result.response.models:
             logger = get_logger()
 
-            logger.debug('A model with uri "{}" already exists. Selecting it'.format(weights_url))
+            logger.debug(
+                'A model with uri "{}" already exists. Selecting it'.format(weights_url)
+            )
 
             model = get_single_result(
-                entity='model',
+                entity="model",
                 query=weights_url,
                 results=result.response.models,
                 log=logger,
@@ -636,11 +1631,14 @@ class InputModel(Model):
         )
 
         from .task import Task
+
         task = Task.current_task()
         if task:
-            comment = 'Imported by task id: {}'.format(task.id) + ('\n' + comment if comment else '')
+            comment = "Imported by task id: {}".format(task.id) + (
+                "\n" + comment if comment else ""
+            )
             project_id = task.project
-            name = name or 'Imported by {}'.format(task.name or '')
+            name = name or "Imported by {}".format(task.name or "")
             # do not register the Task, because we do not want it listed after as "output model",
             # the Task never actually created the Model
             task_id = None
@@ -648,11 +1646,16 @@ class InputModel(Model):
             project_id = None
             task_id = None
 
+        if project:
+            project_id = get_or_create_project(
+                session=task.session if task else Task._get_default_session(),
+                project_name=project,
+            )
+
         if not framework:
             # noinspection PyProtectedMember
             framework, file_ext = Framework._get_file_ext(
-                framework=framework,
-                filename=weights_url
+                framework=framework, filename=weights_url
             )
 
         base_model.update(
@@ -713,24 +1716,27 @@ class InputModel(Model):
 
         if not load_archived:
             # noinspection PyTypeChecker
-            extra = {'system_tags': ["-" + _Task.archived_tag]} \
-                if Session.check_min_api_version('2.3') else {'tags': ["-" + cls._archived_tag]}
+            extra = (
+                {"system_tags": ["-" + _Task.archived_tag]}
+                if Session.check_min_api_version("2.3")
+                else {"tags": ["-" + cls._archived_tag]}
+            )
         else:
             extra = {}
 
         # noinspection PyProtectedMember
-        result = _Model._get_default_session().send(models.GetAllRequest(
-            uri=[weights_url],
-            only_fields=["id", "name", "created"],
-            **extra
-        ))
+        result = _Model._get_default_session().send(
+            models.GetAllRequest(
+                uri=[weights_url], only_fields=["id", "name", "created"], **extra
+            )
+        )
 
         if not result or not result.response or not result.response.models:
             return None
 
         logger = get_logger()
         model = get_single_result(
-            entity='model',
+            entity="model",
             query=weights_url,
             results=result.response.models,
             log=logger,
@@ -758,8 +1764,8 @@ class InputModel(Model):
             .. code-block:: javascript
 
                {
-                    'background': 0,
-                    'person': 1
+                    "background": 0,
+                    "person": 1
                }
 
         :return: An empty model object.
@@ -778,25 +1784,34 @@ class InputModel(Model):
         m._data.labels = label_enumeration
         return this_model
 
-    def __init__(self, model_id=None, name=None, project=None, tags=None, only_published=False):
+    def __init__(
+        self, model_id=None, name=None, project=None, tags=None, only_published=False
+    ):
         # type: (Optional[str], Optional[str], Optional[str], Optional[Sequence[str]], bool) -> None
         """
         Load a model from the Model artifactory,
         based on model_id (uuid) or a model name/projects/tags combination.
 
-        :param model_id: The ClearML Id (system UUID) of the input model whose metadata the **ClearML Server**
+        :param model_id: The ClearML ID (system UUID) of the input model whose metadata the **ClearML Server**
             (backend) stores. If provided all other arguments are ignored
         :param name: Model name to search and load
         :param project: Model project name to search model in
         :param tags: Model tags list to filter by
-        :param only_published: If True filter out non-published (draft) models
+        :param only_published: If True, filter out non-published (draft) models
         """
         if not model_id:
             found_models = self.query_models(
-                project_name=project, model_name=name, tags=tags, only_published=only_published)
+                project_name=project,
+                model_name=name,
+                tags=tags,
+                only_published=only_published,
+            )
             if not found_models:
-                raise ValueError("Could not locate model with project={} name={} tags={} published={}".format(
-                    project, name, tags, only_published))
+                raise ValueError(
+                    "Could not locate model with project={} name={} tags={} published={}".format(
+                        project, name, tags, only_published
+                    )
+                )
             model_id = found_models[0].id
         super(InputModel, self).__init__(model_id)
 
@@ -812,7 +1827,7 @@ class InputModel(Model):
 
         - Imported models (InputModel objects created using the :meth:`Logger.import_model` method).
         - Models whose metadata is already in the ClearML platform, meaning the InputModel object is instantiated
-          from the ``InputModel`` class specifying the the model's ClearML Id as an argument.
+          from the ``InputModel`` class specifying the model's ClearML ID as an argument.
         - Models whose origin is not ClearML that are used to create an InputModel object. For example,
           models created using TensorFlow models.
 
@@ -833,11 +1848,15 @@ class InputModel(Model):
         # noinspection PyProtectedMember
         if running_remotely() and (task.is_main_task() or task._is_remote_main_task()):
             input_models = task.input_models_id
+            # noinspection PyBroadException
             try:
-                model_id = next(m_id for m_name, m_id in input_models if m_name == (name or 'Input Model'))
+                # TODO: (temp fix) At the moment, the UI changes the key of the model hparam
+                # when modifying its value... There is no way to tell which model was changed
+                # so just take the first one in case `name` is not in `input_models`
+                model_id = input_models.get(name, next(iter(input_models.values())))
                 self._base_model_id = model_id
                 self._base_model = InputModel(model_id=model_id)._get_base_model()
-            except StopIteration:
+            except Exception:
                 model_id = None
 
         if not model_id:
@@ -876,8 +1895,8 @@ class OutputModel(BaseModel):
        When executing a Task (experiment) remotely in a worker, you can modify the model configuration and / or model's
        label enumeration using the **ClearML Web-App**.
     """
-
     _default_output_uri = None
+    _offline_folder = "models"
 
     @property
     def published(self):
@@ -943,8 +1962,8 @@ class OutputModel(BaseModel):
         .. code-block:: javascript
 
            {
-                'background': 0,
-                'person': 1
+                "background": 0,
+                "person": 1
            }
 
         :return: The label enumeration.
@@ -964,8 +1983,8 @@ class OutputModel(BaseModel):
             .. code-block:: javascript
 
                {
-                    'background': 0,
-                    'person': 1
+                    "background": 0,
+                    "person": 1
                }
 
         """
@@ -1010,8 +2029,8 @@ class OutputModel(BaseModel):
             .. code-block:: javascript
 
                {
-                    'background': 0,
-                    'person': 1
+                    "background": 0,
+                    "person": 1
                }
 
         :param str name: The name for the newly created model. (Optional)
@@ -1019,31 +2038,39 @@ class OutputModel(BaseModel):
         :param str comment: A comment / description for the model. (Optional)
         :param framework: The framework of the model or a Framework object. (Optional)
         :type framework: str or Framework object
-        :param base_model_id: optional, model id to be reused
+        :param base_model_id: optional, model ID to be reused
         """
         if not task:
             from .task import Task
+
             task = Task.current_task()
             if not task:
-                raise ValueError("task object was not provided, and no current task was found")
+                raise ValueError(
+                    "task object was not provided, and no current task was found"
+                )
 
         super(OutputModel, self).__init__(task=task)
 
-        config_text = self._resolve_config(config_text=config_text, config_dict=config_dict)
+        config_text = self._resolve_config(
+            config_text=config_text, config_dict=config_dict
+        )
 
         self._model_local_filename = None
         self._last_uploaded_url = None
         self._base_model = None
         self._base_model_id = None
         self._task_connect_name = None
+        self._label_enumeration = label_enumeration
         # noinspection PyProtectedMember
         self._floating_data = create_dummy_model(
             design=_Model._wrap_design(config_text),
             labels=label_enumeration or task.get_labels_enumeration(),
             name=name or self._task.name,
             tags=tags,
-            comment='{} by task id: {}'.format('Created' if not base_model_id else 'Overwritten', task.id) +
-                    ('\n' + comment if comment else ''),
+            comment="{} by task id: {}".format(
+                "Created" if not base_model_id else "Overwritten", task.id
+            )
+            + ("\n" + comment if comment else ""),
             framework=framework,
             upload_storage_uri=task.output_uri,
         )
@@ -1061,13 +2088,18 @@ class OutputModel(BaseModel):
                 task_id=self._task.id,
                 project_id=self._task.project,
                 name=self._floating_data.name or self._task.name,
-                comment=('{}\n{}'.format(_base_model.comment, self._floating_data.comment)
-                         if (_base_model.comment and self._floating_data.comment and
-                             self._floating_data.comment not in _base_model.comment)
-                         else (_base_model.comment or self._floating_data.comment)),
+                comment=(
+                    "{}\n{}".format(_base_model.comment, self._floating_data.comment)
+                    if (
+                        _base_model.comment
+                        and self._floating_data.comment
+                        and self._floating_data.comment not in _base_model.comment
+                    )
+                    else (_base_model.comment or self._floating_data.comment)
+                ),
                 tags=self._floating_data.tags,
                 framework=self._floating_data.framework,
-                upload_storage_uri=self._floating_data.upload_storage_uri
+                upload_storage_uri=self._floating_data.upload_storage_uri,
             )
             self._base_model = _base_model
             self._floating_data = None
@@ -1092,7 +2124,9 @@ class OutputModel(BaseModel):
             Use examples would be GANs or model ensemble
         """
         if self._task != task:
-            raise ValueError('Can only connect preexisting model to task, but this is a fresh model')
+            raise ValueError(
+                "Can only connect preexisting model to task, but this is a fresh model"
+            )
 
         if name:
             self._task_connect_name = name
@@ -1105,14 +2139,22 @@ class OutputModel(BaseModel):
         if not self._task._get_model_config_text():
             # noinspection PyProtectedMember
             task._set_model_config(
-                config_text=model.model_design if hasattr(model, "model_design") else model.design.get("design", "")
+                config_text=model.model_design
+                if hasattr(model, "model_design")
+                else model.design.get("design", "")
             )
         if not self._task.get_labels_enumeration():
-            task.set_model_label_enumeration(model.data.labels if hasattr(model, "data") else model.labels)
+            task.set_model_label_enumeration(
+                model.data.labels if hasattr(model, "data") else model.labels
+            )
 
         if self._base_model:
             self._base_model.update_for_task(
-                task_id=self._task.id, model_id=self.id, type_="output", name=self._task_connect_name)
+                task_id=self._task.id,
+                model_id=self.id,
+                type_="output",
+                name=self._task_connect_name,
+            )
 
     def set_upload_destination(self, uri):
         # type: (str) -> None
@@ -1120,7 +2162,7 @@ class OutputModel(BaseModel):
         Set the URI of the storage destination for uploaded model weight files.
         Supported storage destinations include S3, Google Cloud Storage), and file locations.
 
-        Using this method, files uploads are separate and then a link to each is stored in the model object.
+        Using this method, file uploads are separate and then a link to each is stored in the model object.
 
         .. note::
            For storage requiring credentials, the credentials are stored in the ClearML configuration file,
@@ -1151,7 +2193,9 @@ class OutputModel(BaseModel):
         try:
             uri = storage.verify_upload(folder_uri=uri)
         except Exception:
-            raise ValueError("Could not set destination uri to: %s [Check write permissions]" % uri)
+            raise ValueError(
+                "Could not set destination uri to: %s [Check write permissions]" % uri
+            )
 
         # store default uri
         self._get_base_model().upload_storage_uri = uri
@@ -1182,14 +2226,13 @@ class OutputModel(BaseModel):
             is the ``weights_filename`` value. (Optional)
         :param bool auto_delete_file: Delete the temporary file after uploading (Optional)
 
-            - ``True`` - Delete (Default)
-            - ``False`` - Do not delete
+          - ``True`` - Delete (Default)
+          - ``False`` - Do not delete
 
         :param str register_uri: The URI of an already uploaded weights file. The URI must be valid. Specify
             ``register_uri`` or ``weights_filename``, but not both.
         :param int iteration: The iteration number.
-        :param bool update_comment: Update the model comment with the local weights file name (to maintain
-            provenance) (Optional)
+        :param bool update_comment: Update the model comment with the local weights file name (to maintain provenance) (Optional)
 
             - ``True`` - Update model comment (Default)
             - ``False`` - Do not update
@@ -1203,19 +2246,34 @@ class OutputModel(BaseModel):
                 if filename:
                     os.remove(filename)
             except OSError:
-                self._log.debug('Failed removing temporary file %s' % filename)
+                self._log.debug("Failed removing temporary file %s" % filename)
 
         # test if we can update the model
         if self.id and self.published:
-            raise ValueError('Model is published and cannot be changed')
+            raise ValueError("Model is published and cannot be changed")
 
-        if (not weights_filename and not register_uri) or (weights_filename and register_uri):
-            raise ValueError('Model update must have either local weights file to upload, '
-                             'or pre-uploaded register_uri, never both')
+        if (not weights_filename and not register_uri) or (
+            weights_filename and register_uri
+        ):
+            raise ValueError(
+                "Model update must have either local weights file to upload, "
+                "or pre-uploaded register_uri, never both"
+            )
 
         # only upload if we are connected to a task
         if not self._task:
-            raise Exception('Missing a task for this model')
+            raise Exception("Missing a task for this model")
+
+        if self._task.is_offline() and (weights_filename is None or not Path(weights_filename).is_dir()):
+            return self._update_weights_offline(
+                weights_filename=weights_filename,
+                upload_uri=upload_uri,
+                target_filename=target_filename,
+                register_uri=register_uri,
+                iteration=iteration,
+                update_comment=update_comment,
+                is_package=is_package,
+            )
 
         if weights_filename is not None:
             # Check if weights_filename is a folder, is package upload
@@ -1225,7 +2283,8 @@ class OutputModel(BaseModel):
                     upload_uri=upload_uri,
                     target_filename=target_filename or Path(weights_filename).name,
                     auto_delete_file=auto_delete_file,
-                    iteration=iteration)
+                    iteration=iteration,
+                )
 
             # make sure we delete the previous file, if it exists
             if self._model_local_filename != weights_filename:
@@ -1236,17 +2295,21 @@ class OutputModel(BaseModel):
 
         # make sure the created model is updated:
         out_model_file_name = target_filename or weights_filename or register_uri
-        name = Path(out_model_file_name).stem if out_model_file_name else (self._task_connect_name or "Output Model")
+        name = (
+            Path(out_model_file_name).stem
+            if out_model_file_name
+            else (self._task_connect_name or "Output Model")
+        )
         model = self._get_force_base_model(task_model_entry=name)
         if not model:
-            raise ValueError('Failed creating internal output model')
+            raise ValueError("Failed creating internal output model")
 
         # select the correct file extension based on the framework,
         # or update the framework based on the file extension
         # noinspection PyProtectedMember
         framework, file_ext = Framework._get_file_ext(
             framework=self._get_model_data().framework,
-            filename=target_filename or weights_filename or register_uri
+            filename=target_filename or weights_filename or register_uri,
         )
 
         if weights_filename:
@@ -1260,25 +2323,36 @@ class OutputModel(BaseModel):
 
         # let us know the iteration number, we put it in the comment section for now.
         if update_comment:
-            comment = self.comment or ''
-            iteration_msg = 'snapshot {} stored'.format(weights_filename or register_uri)
-            if not comment.startswith('\n'):
-                comment = '\n' + comment
+            comment = self.comment or ""
+            iteration_msg = "snapshot {} stored".format(
+                weights_filename or register_uri
+            )
+            if not comment.startswith("\n"):
+                comment = "\n" + comment
             comment = iteration_msg + comment
         else:
             comment = None
 
         # if we have no output destination, just register the local model file
-        if weights_filename and not self.upload_storage_uri and not self._task.storage_uri:
+        if (
+            weights_filename
+            and not self.upload_storage_uri
+            and not self._task.storage_uri
+        ):
             register_uri = weights_filename
             weights_filename = None
             auto_delete_file = False
-            self._log.info('No output storage destination defined, registering local model %s' % register_uri)
+            self._log.info(
+                "No output storage destination defined, registering local model %s"
+                % register_uri
+            )
 
         # start the upload
         if weights_filename:
             if not model.upload_storage_uri:
-                self.set_upload_destination(self.upload_storage_uri or self._task.storage_uri)
+                self.set_upload_destination(
+                    self.upload_storage_uri or self._task.storage_uri
+                )
 
             output_uri = model.update_and_upload(
                 model_file=weights_filename,
@@ -1292,7 +2366,12 @@ class OutputModel(BaseModel):
             )
         elif register_uri:
             register_uri = StorageHelper.conform_url(register_uri)
-            output_uri = model.update(uri=register_uri, task_id=self._task.id, framework=framework, comment=comment)
+            output_uri = model.update(
+                uri=register_uri,
+                task_id=self._task.id,
+                framework=framework,
+                comment=comment,
+            )
         else:
             output_uri = None
 
@@ -1310,7 +2389,7 @@ class OutputModel(BaseModel):
         upload_uri=None,  # type: Optional[str]
         target_filename=None,  # type: Optional[str]
         auto_delete_file=True,  # type: bool
-        iteration=None  # type: Optional[int]
+        iteration=None,  # type: Optional[int]
     ):
         # type: (...) -> str
         """
@@ -1339,52 +2418,70 @@ class OutputModel(BaseModel):
         :return: The uploaded URI for the weights package.
         """
         # create list of files
-        if (not weights_filenames and not weights_path) or (weights_filenames and weights_path):
-            raise ValueError('Model update weights package should get either '
-                             'directory path to pack or a list of files')
+        if (not weights_filenames and not weights_path) or (
+            weights_filenames and weights_path
+        ):
+            raise ValueError(
+                "Model update weights package should get either "
+                "directory path to pack or a list of files"
+            )
 
         if not weights_filenames:
-            weights_filenames = list(map(six.text_type, Path(weights_path).rglob('*')))
+            weights_filenames = list(map(six.text_type, Path(weights_path).rglob("*")))
         elif weights_filenames and len(weights_filenames) > 1:
             weights_path = get_common_path(weights_filenames)
 
         # create packed model from all the files
-        fd, zip_file = mkstemp(prefix='model_package.', suffix='.zip')
+        fd, zip_file = mkstemp(prefix="model_package.", suffix=".zip")
         try:
-            with zipfile.ZipFile(zip_file, 'w', allowZip64=True, compression=zipfile.ZIP_STORED) as zf:
+            with zipfile.ZipFile(
+                zip_file, "w", allowZip64=True, compression=zipfile.ZIP_STORED
+            ) as zf:
                 for filename in weights_filenames:
-                    relative_file_name = Path(filename).name if not weights_path else \
-                        Path(filename).absolute().relative_to(Path(weights_path).absolute()).as_posix()
+                    relative_file_name = (
+                        Path(filename).name
+                        if not weights_path
+                        else Path(filename)
+                        .absolute()
+                        .relative_to(Path(weights_path).absolute())
+                        .as_posix()
+                    )
                     zf.write(filename, arcname=relative_file_name)
         finally:
             os.close(fd)
 
         # now we can delete the files (or path if provided)
         if auto_delete_file:
+
             def safe_remove(path, is_dir=False):
                 try:
                     (os.rmdir if is_dir else os.remove)(path)
                 except OSError:
-                    self._log.info('Failed removing temporary {}'.format(path))
+                    self._log.info("Failed removing temporary {}".format(path))
 
             for filename in weights_filenames:
                 safe_remove(filename)
             if weights_path:
                 safe_remove(weights_path, is_dir=True)
 
-        if target_filename and not target_filename.lower().endswith('.zip'):
-            target_filename += '.zip'
+        if target_filename and not target_filename.lower().endswith(".zip"):
+            target_filename += ".zip"
 
         # and now we should upload the file, always delete the temporary zip file
-        comment = self.comment or ''
-        iteration_msg = 'snapshot {} stored'.format(str(weights_filenames))
-        if not comment.startswith('\n'):
-            comment = '\n' + comment
+        comment = self.comment or ""
+        iteration_msg = "snapshot {} stored".format(str(weights_filenames))
+        if not comment.startswith("\n"):
+            comment = "\n" + comment
         comment = iteration_msg + comment
         self.comment = comment
-        uploaded_uri = self.update_weights(weights_filename=zip_file, auto_delete_file=True, upload_uri=upload_uri,
-                                           target_filename=target_filename or 'model_package.zip',
-                                           iteration=iteration, update_comment=False)
+        uploaded_uri = self.update_weights(
+            weights_filename=zip_file,
+            auto_delete_file=True,
+            upload_uri=upload_uri,
+            target_filename=target_filename or "model_package.zip",
+            iteration=iteration,
+            update_comment=False,
+        )
         # set the model tag (by now we should have a model object) so we know we have packaged file
         self._set_package_tag()
         return uploaded_uri
@@ -1409,7 +2506,9 @@ class OutputModel(BaseModel):
         if not self._validate_update():
             return False
 
-        config_text = self._resolve_config(config_text=config_text, config_dict=config_dict)
+        config_text = self._resolve_config(
+            config_text=config_text, config_dict=config_dict
+        )
 
         if self._task and not self._task.get_model_config_text():
             self._task.set_model_config(config_text=config_text)
@@ -1437,13 +2536,18 @@ class OutputModel(BaseModel):
             .. code-block:: javascript
 
                {
-                    'background': 0,
-                    'person': 1
+                    "background": 0,
+                    "person": 1
                }
 
         :return:
         """
-        validate_dict(labels, key_types=six.string_types, value_types=six.integer_types, desc='label enumeration')
+        validate_dict(
+            labels,
+            key_types=six.string_types,
+            value_types=six.integer_types,
+            desc="label enumeration",
+        )
 
         if not self._validate_update():
             return
@@ -1484,6 +2588,57 @@ class OutputModel(BaseModel):
         """
         cls._default_output_uri = str(output_uri) if output_uri else None
 
+    def _update_weights_offline(
+        self,
+        weights_filename=None,  # type: Optional[str]
+        upload_uri=None,  # type: Optional[str]
+        target_filename=None,  # type: Optional[str]
+        register_uri=None,  # type: Optional[str]
+        iteration=None,  # type: Optional[int]
+        update_comment=True,  # type: bool
+        is_package=False,  # type: bool
+    ):
+        # type: (...) -> str
+        if (not weights_filename and not register_uri) or (weights_filename and register_uri):
+            raise ValueError(
+                "Model update must have either local weights file to upload, "
+                "or pre-uploaded register_uri, never both"
+            )
+        if not self._task:
+            raise Exception("Missing a task for this model")
+        weights_filename_offline = None
+        if weights_filename:
+            weights_filename_offline = (
+                self._task.get_offline_mode_folder() / self._offline_folder / Path(weights_filename).name
+            ).as_posix()
+            os.makedirs(os.path.dirname(weights_filename_offline), exist_ok=True)
+            shutil.copyfile(weights_filename, weights_filename_offline)
+        # noinspection PyProtectedMember
+        self._task._offline_output_models.append(
+            dict(
+                init=dict(
+                    config_text=self.config_text,
+                    config_dict=self.config_dict,
+                    label_enumeration=self._label_enumeration,
+                    name=self.name,
+                    tags=self.tags,
+                    comment=self.comment,
+                    framework=self.framework
+                ),
+                weights=dict(
+                    weights_filename=weights_filename_offline,
+                    upload_uri=upload_uri,
+                    target_filename=target_filename,
+                    register_uri=register_uri,
+                    iteration=iteration,
+                    update_comment=update_comment,
+                    is_package=is_package
+                ),
+                output_uri=self._get_base_model().upload_storage_uri or self._default_output_uri
+            )
+        )
+        return weights_filename_offline or register_uri
+
     def _get_force_base_model(self, model_name=None, task_model_entry=None):
         if self._base_model:
             return self._base_model
@@ -1496,7 +2651,11 @@ class OutputModel(BaseModel):
         # noinspection PyProtectedMember
         config_text = self._task._get_model_config_text()
         model_name = model_name or self._floating_data.name or self._task.name
-        task_model_entry = task_model_entry or self._task_connect_name or Path(self._get_model_data().uri).stem
+        task_model_entry = (
+            task_model_entry
+            or self._task_connect_name
+            or Path(self._get_model_data().uri).stem
+        )
         parent = self._task.input_models_id.get(task_model_entry)
         self._base_model.update(
             labels=self._floating_data.labels or labels,
@@ -1508,7 +2667,7 @@ class OutputModel(BaseModel):
             comment=self._floating_data.comment,
             tags=self._floating_data.tags,
             framework=self._floating_data.framework,
-            upload_storage_uri=self._floating_data.upload_storage_uri
+            upload_storage_uri=self._floating_data.upload_storage_uri,
         )
 
         # remove model floating change set, by now they should have matched the task.
@@ -1516,12 +2675,22 @@ class OutputModel(BaseModel):
 
         # now we have to update the creator task so it points to us
         if str(self._task.status) not in (
-                str(self._task.TaskStatusEnum.created), str(self._task.TaskStatusEnum.in_progress)):
-            self._log.warning('Could not update last created model in Task {}, '
-                              'Task status \'{}\' cannot be updated'.format(self._task.id, self._task.status))
+            str(self._task.TaskStatusEnum.created),
+            str(self._task.TaskStatusEnum.in_progress),
+        ):
+            self._log.warning(
+                "Could not update last created model in Task {}, "
+                "Task status '{}' cannot be updated".format(
+                    self._task.id, self._task.status
+                )
+            )
         else:
             self._base_model.update_for_task(
-                task_id=self._task.id, model_id=self.id, type_="output", name=task_model_entry)
+                task_id=self._task.id,
+                model_id=self.id,
+                type_="output",
+                name=task_model_entry,
+            )
 
         return self._base_model
 
@@ -1538,7 +2707,7 @@ class OutputModel(BaseModel):
     def _validate_update(self):
         # test if we can update the model
         if self.id and self.published:
-            raise ValueError('Model is published and cannot be changed')
+            raise ValueError("Model is published and cannot be changed")
 
         return True
 

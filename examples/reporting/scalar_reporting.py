@@ -11,19 +11,23 @@ def report_scalars(logger):
     """
     # report two scalar series on the same graph
     for i in range(100):
-        logger.report_scalar("unified graph", "series A", iteration=i, value=1./(i+1))
-        logger.report_scalar("unified graph", "series B", iteration=i, value=10./(i+1))
+        logger.report_scalar(title="unified graph", series="series A", iteration=i, value=1. / (i + 1))
+        logger.report_scalar(title="unified graph", series="series B", iteration=i, value=10. / (i + 1))
 
     # report two scalar series on two different graphs
     for i in range(100):
-        logger.report_scalar("graph A", "series A", iteration=i, value=1./(i+1))
-        logger.report_scalar("graph B", "series B", iteration=i, value=10./(i+1))
+        logger.report_scalar(title="graph A", series="series A", iteration=i, value=1. / (i + 1))
+        logger.report_scalar(title="graph B", series="series B", iteration=i, value=10. / (i + 1))
+
+    # report single scalars
+    logger.report_single_value(name="metric A", value=486)
+    logger.report_single_value(name="metric B", value=305.95)
 
 
 def main():
     # Connecting ClearML with the current process,
     # from here on everything is logged automatically
-    task = Task.init(project_name="examples", task_name="scalar reporting")
+    task = Task.init(project_name="examples", task_name="Scalar reporting")
 
     print('reporting scalar graphs')
 

@@ -1,3 +1,4 @@
+import json
 import numpy as np
 
 from ..errors import UsageError
@@ -11,7 +12,7 @@ from attr import attrs, attrib
 
 
 def create_2d_histogram_plot(np_row_wise, labels, title=None, xtitle=None, ytitle=None, series=None, xlabels=None,
-                             comment=None, mode='group', layout_config=None):
+                             comment=None, mode='group', data_args=None, layout_config=None):
     """
     Create a 2D Plotly histogram chart from a 2D numpy array
     :param np_row_wise: 2D numpy data array
@@ -19,8 +20,10 @@ def create_2d_histogram_plot(np_row_wise, labels, title=None, xtitle=None, ytitl
     :param title: Chart title
     :param xtitle: X-Series title
     :param ytitle: Y-Series title
+    :param xlabels: The labels of the x axis.
     :param comment: comment underneath the title
     :param mode: multiple histograms mode. valid options are: stack / group / relative. Default is 'group'.
+    :param data_args: optional extra data configuration
     :param layout_config: optional extra layout configuration
     :return: Plotly chart dict.
     """
@@ -43,8 +46,9 @@ def create_2d_histogram_plot(np_row_wise, labels, title=None, xtitle=None, ytitl
     elif not labels and xlabels:
         labels = [series]
 
-    data = [_np_row_to_plotly_data_item(np_row=np_row_wise[i, :], label=labels[i] if labels else None, xlabels=xlabels)
-            for i in range(np_row_wise.shape[0])]
+    data = [_np_row_to_plotly_data_item(
+        np_row=np_row_wise[i, :], label=labels[i] if labels else None, xlabels=xlabels, data_args=data_args
+    ) for i in range(np_row_wise.shape[0])]
     return _plotly_hist_dict(title=series if use_series else title,
                              xtitle=xtitle, ytitle=ytitle, mode=mode, data=data, comment=comment,
                              layout_config=layout_config)
@@ -249,12 +253,13 @@ def create_value_matrix(np_value_matrix, title="Heatmap Matrix", xlabels=None, y
     if yaxis_reversed:
         conf_matrix_plot['layout']['yaxis']['autorange'] = "reversed"
 
-    if custom_colors:
+    if custom_colors and not layout_config:
         scale, bar = _get_z_colorbar_data()
         conf_matrix_plot["data"][0].update({"colorscale": scale})
         conf_matrix_plot["data"][0].update({"colorbar": bar})
 
     if layout_config:
+        conf_matrix_plot["data"][0] = merge_dicts(conf_matrix_plot["data"][0], layout_config)
         conf_matrix_plot["layout"] = merge_dicts(conf_matrix_plot["layout"], layout_config)
 
     return conf_matrix_plot
@@ -408,11 +413,13 @@ def _plotly_hist_dict(title, xtitle, ytitle, mode='group', data=None, comment=No
     return plotly_object
 
 
-def _np_row_to_plotly_data_item(np_row, label, xlabels=None):
+def _np_row_to_plotly_data_item(np_row, label, xlabels=None, data_args=None):
     """
     Convert a numpy data row into a Plotly chart data item
     :param np_row: numpy 1D data row
     :param label: Item label
+    :param xlabels: The labels of the x axis.
+    :param dict data_args: Plotly data arguments
     :return: A plotly data item dict.
     """
     bins = list(range(np_row.shape[0])) if xlabels is None else list(xlabels)
@@ -424,6 +431,8 @@ def _np_row_to_plotly_data_item(np_row, label, xlabels=None):
         # "text": mylabels,
         "type": "bar"
     }
+    if data_args:
+        this_trace_data.update(data_args)
     return this_trace_data
 
 
@@ -473,7 +482,7 @@ def plotly_scatter3d_layout_dict(title="Scatter", xaxis_title="X", yaxis_title="
     return plotly_object
 
 
-def create_plotly_table(table_plot, title, series, layout_config=None):
+def create_plotly_table(table_plot, title, series, layout_config=None, data_config=None):
     """
     Create a basic Plotly table json style to be sent
 
@@ -483,6 +492,7 @@ def create_plotly_table(table_plot, title, series, layout_config=None):
     :param series: Series (AKA variant)
     :type series: str
     :param layout_config: additional configuration layout
+    :param data_config: additional configuration for the data
     :return: dict with plotly data.
     """
     is_list = isinstance(table_plot, (list, tuple))
@@ -501,7 +511,7 @@ def create_plotly_table(table_plot, title, series, layout_config=None):
             )
         index_added = not isinstance(table_plot.index, pd.RangeIndex)
         headers_values = list([col] for col in table_plot.columns)
-        cells_values = table_plot.T.values.tolist()
+        cells_values = json.loads(table_plot.T.to_json(orient='values', date_format='iso'))
         if index_added:
             if isinstance(table_plot.index, pd.MultiIndex):
                 headers_values = [n or "" for n in (table_plot.index.names or [])] + headers_values
@@ -529,11 +539,14 @@ def create_plotly_table(table_plot, title, series, layout_config=None):
             }
         }],
         "layout": {
-            "title": title,
-            "name": series,
+            "title.text": title,
+            "title": series,
         }
     }
     if layout_config:
         ret["layout"] = merge_dicts(ret["layout"], layout_config)
+
+    if data_config and len(ret["data"]) == 1:
+        ret["data"][0] = merge_dicts(ret["data"][0], data_config)
 
     return ret

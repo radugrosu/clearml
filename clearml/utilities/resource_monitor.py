@@ -56,6 +56,9 @@ class ResourceMonitor(BackgroundMonitor):
                 pass
 
     def daemon(self):
+        if self._is_thread_mode_and_not_main_process():
+            return
+
         seconds_since_started = 0
         reported = 0
         last_iteration = 0
@@ -214,13 +217,24 @@ class ResourceMonitor(BackgroundMonitor):
         if "coretemp" in sensor_stat and len(sensor_stat["coretemp"]):
             stats["cpu_temperature"] = max([float(t.current) for t in sensor_stat["coretemp"]])
 
+        # protect against permission issues
         # update cached measurements
-        net_stats = psutil.net_io_counters()
-        stats["network_tx_mbs"] = bytes_to_megabytes(net_stats.bytes_sent)
-        stats["network_rx_mbs"] = bytes_to_megabytes(net_stats.bytes_recv)
-        io_stats = psutil.disk_io_counters()
-        stats["io_read_mbs"] = bytes_to_megabytes(io_stats.read_bytes)
-        stats["io_write_mbs"] = bytes_to_megabytes(io_stats.write_bytes)
+        # noinspection PyBroadException
+        try:
+            net_stats = psutil.net_io_counters()
+            stats["network_tx_mbs"] = bytes_to_megabytes(net_stats.bytes_sent)
+            stats["network_rx_mbs"] = bytes_to_megabytes(net_stats.bytes_recv)
+        except Exception:
+            pass
+
+        # protect against permission issues
+        # noinspection PyBroadException
+        try:
+            io_stats = psutil.disk_io_counters()
+            stats["io_read_mbs"] = bytes_to_megabytes(io_stats.read_bytes)
+            stats["io_write_mbs"] = bytes_to_megabytes(io_stats.write_bytes)
+        except Exception:
+            pass
 
         # check if we can access the gpu statistics
         if self._gpustat:

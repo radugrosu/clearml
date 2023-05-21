@@ -1,14 +1,14 @@
+import atexit
 import datetime
 import json
 import logging
 import math
-from multiprocessing import Semaphore
-from threading import Event as TrEvent
-from time import sleep
+import os
+from time import sleep, time
 
 import numpy as np
 import six
-from six.moves.queue import Queue as TrQueue, Empty
+from six.moves.queue import Empty
 
 from .events import (
     ScalarEvent, VectorEvent, ImageEvent, PlotEvent, ImageEventNoUpload,
@@ -21,7 +21,7 @@ from ...utilities.plotly_reporter import (
     create_2d_histogram_plot, create_value_matrix, create_3d_surface,
     create_2d_scatter_series, create_3d_scatter_series, create_line_plot, plotly_scatter3d_layout_dict,
     create_image_plot, create_plotly_table, )
-from ...utilities.process.mp import BackgroundMonitor
+from ...utilities.process.mp import BackgroundMonitor, ForkSemaphore, ForkEvent, ForkQueue
 from ...utilities.py3_interop import AbstractContextManager
 from ...utilities.process.mp import SafeQueue as PrQueue, SafeEvent
 
@@ -32,71 +32,152 @@ except ImportError:
 
 
 class BackgroundReportService(BackgroundMonitor, AsyncManagerMixin):
-    def __init__(self, task, async_enable, metrics, flush_frequency, flush_threshold):
-        super(BackgroundReportService, self).__init__(
-            task=task, wait_period=flush_frequency)
+    __daemon_live_check_timeout = 10.0
+
+    def __init__(self, task, async_enable, metrics, flush_frequency, flush_threshold, for_model=False):
+        super(BackgroundReportService, self).__init__(task=task, wait_period=flush_frequency, for_model=for_model)
         self._flush_threshold = flush_threshold
-        self._exit_event = TrEvent()
-        self._empty_state_event = TrEvent()
-        self._queue = TrQueue()
+        self._flush_event = ForkEvent()
+        self._empty_state_event = ForkEvent()
+        self._queue = ForkQueue()
         self._queue_size = 0
-        self._res_waiting = Semaphore()
+        self._res_waiting = ForkSemaphore()
         self._metrics = metrics
         self._storage_uri = None
         self._async_enable = async_enable
+        self._is_thread_mode_in_subprocess_flag = None
+
+        # We need this list because on close, the daemon thread might call _write.
+        # _write will pop everything from queue and add the events to a list,
+        # then attempt to send the list of events to the backend.
+        # But it's possible on close for the daemon thread to die in the middle of all that.
+        # So we have to preserve the list the daemon thread attempted to send to the backend
+        # such that we can retry this.
+        # It is possible that we send the same events twice or that we are missing exactly one event.
+        # Both of these cases should be very rare and I don't really see how we can do better.
+        self._processing_events = []
 
     def set_storage_uri(self, uri):
         self._storage_uri = uri
 
     def set_subprocess_mode(self):
-        if isinstance(self._queue, TrQueue):
+        if isinstance(self._queue, ForkQueue):
             self._write()
             self._queue = PrQueue()
-        if not isinstance(self._exit_event, SafeEvent):
-            self._exit_event = SafeEvent()
+        if not isinstance(self._event, SafeEvent):
+            self._event = SafeEvent()
         if not isinstance(self._empty_state_event, SafeEvent):
             self._empty_state_event = SafeEvent()
         super(BackgroundReportService, self).set_subprocess_mode()
 
     def stop(self):
         if isinstance(self._queue, PrQueue):
-            self._queue.close(self._event)
+            self._queue.close(self._flush_event)
         if not self.is_subprocess_mode() or self.is_subprocess_alive():
-            self._exit_event.set()
+            self._flush_event.set()
         super(BackgroundReportService, self).stop()
 
+    def wait(self, timeout=None):
+        if not self._done_ev:
+            return
+        if not self.is_subprocess_mode() or self.is_subprocess_mode_and_parent_process():
+            tic = time()
+            while self.is_alive() and (not timeout or time()-tic < timeout):
+                if self._done_ev.wait(timeout=1.0):
+                    break
+
     def flush(self):
+        while isinstance(self._queue, PrQueue) and self._queue.is_pending():
+            sleep(0.1)
         self._queue_size = 0
+        # stop background process?!
         if not self.is_subprocess_mode() or self.is_subprocess_alive():
-            self._event.set()
+            self._flush_event.set()
 
     def wait_for_events(self, timeout=None):
+        if self._is_subprocess_mode_and_not_parent_process() and self.get_at_exit_state():
+            return
+
         # noinspection PyProtectedMember
         if self._is_subprocess_mode_and_not_parent_process():
             while self._queue and not self._queue.empty():
                 sleep(0.1)
             return
+
         self._empty_state_event.clear()
-        return self._empty_state_event.wait(timeout)
+        if isinstance(self._empty_state_event, ForkEvent):
+            self._flush_event.set()
+            tic = time()
+
+            while (
+                self._thread
+                and (self._thread is True or self._thread.is_alive())
+                and (not timeout or time() - tic < timeout)
+            ):
+                if self._empty_state_event.wait(timeout=1.0):
+                    break
+                if self._event.wait(0) or self._done_ev.wait(0):
+                    break
+                # if enough time passed and the flush event was not cleared,
+                # there is no daemon thread running, we should leave
+                if time() - tic > self.__daemon_live_check_timeout and self._flush_event.wait(0):
+                    self._write()
+                    break
+        elif isinstance(self._empty_state_event, SafeEvent):
+            tic = time()
+            while self.is_subprocess_alive() and (not timeout or time()-tic < timeout):
+                if self._empty_state_event.wait(timeout=1.0):
+                    break
+
+        return
 
     def add_event(self, ev):
         if not self._queue:
             return
+        # check that we did not loose the reporter sub-process
+        if self.is_subprocess_mode() and not self._fast_is_subprocess_alive():
+            # we lost the reporting subprocess, let's switch to thread mode
+            # gel all data, work on local queue:
+            self._write()
+            # replace queue:
+            self._queue = ForkQueue()
+            self._queue_size = 0
+            self._event = ForkEvent()
+            self._done_ev = ForkEvent()
+            self._start_ev = ForkEvent()
+            self._flush_event = ForkEvent()
+            self._empty_state_event = ForkEvent()
+            self._res_waiting = ForkSemaphore()
+            # set thread mode
+            self._subprocess = False
+            self._is_thread_mode_in_subprocess_flag = None
+            # start background thread
+            self._thread = None
+            self._start()
+            logging.getLogger('clearml.reporter').warning(
+                'Event reporting sub-process lost, switching to thread based reporting')
+
         self._queue.put(ev)
         self._queue_size += 1
         if self._queue_size >= self._flush_threshold:
             self.flush()
 
     def daemon(self):
-        while not self._exit_event.wait(0):
-            self._event.wait(self._wait_timeout)
-            self._event.clear()
+        self._is_thread_mode_in_subprocess_flag = self._is_thread_mode_and_not_main_process()
+
+        while not self._event.wait(0):
+            self._flush_event.wait(self._wait_timeout)
+            self._flush_event.clear()
+            # lock state
             self._res_waiting.acquire()
             self._write()
             # wait for all reports
             if self.get_num_results() > 0:
                 self.wait_for_results()
-            self._empty_state_event.set()
+            # set empty flag only if we are not waiting for exit signal
+            if not self._event.wait(0):
+                self._empty_state_event.set()
+            # unlock state
             self._res_waiting.release()
         # make sure we flushed everything
         self._async_enable = False
@@ -110,8 +191,12 @@ class BackgroundReportService(BackgroundMonitor, AsyncManagerMixin):
     def _write(self):
         if self._queue.empty():
             return
-        # print('reporting %d events' % len(self._events))
-        events = []
+
+        if self._async_enable:
+            events = []
+        else:
+            events = self._processing_events
+
         while not self._queue.empty():
             try:
                 events.append(self._queue.get(block=False))
@@ -119,10 +204,20 @@ class BackgroundReportService(BackgroundMonitor, AsyncManagerMixin):
                 break
         if not events:
             return
+        if self._is_thread_mode_in_subprocess_flag:
+            for e in events:
+                if isinstance(e, UploadEvent):
+                    # noinspection PyProtectedMember
+                    e._generate_file_name(force_pid_suffix=os.getpid())
+
         res = self._metrics.write_events(
             events, async_enable=self._async_enable, storage_uri=self._storage_uri)
+
         if self._async_enable:
             self._add_async_result(res)
+        else:
+            # python 2.7 style clear()
+            self._processing_events[:] = []
 
     def send_all_events(self, wait=True):
         self._write()
@@ -155,15 +250,12 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         reporter.flush()
     """
 
-    def __init__(self, metrics, task, flush_threshold=10, async_enable=False, use_subprocess=False):
+    def __init__(self, metrics, task, async_enable=False, for_model=False):
         """
         Create a reporter
         :param metrics: A Metrics manager instance that handles actual reporting, uploads etc.
         :type metrics: .backend_interface.metrics.Metrics
         :param task: Task object
-        :param flush_threshold: Events flush threshold. This determines the threshold over which cached reported events
-            are flushed and sent to the backend.
-        :type flush_threshold: int
         """
         log = metrics.log.getChild('reporter')
         log.setLevel(log.level)
@@ -177,9 +269,17 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         self._async_enable = async_enable
         self._flush_frequency = 5.0
         self._max_iteration = 0
+        self._for_model = for_model
+        flush_threshold = config.get("development.worker.report_event_flush_threshold", 100)
         self._report_service = BackgroundReportService(
-            task=task, async_enable=async_enable, metrics=metrics,
-            flush_frequency=self._flush_frequency, flush_threshold=flush_threshold)
+            task=task,
+            async_enable=async_enable,
+            metrics=metrics,
+            flush_frequency=self._flush_frequency,
+            flush_threshold=flush_threshold,
+            for_model=for_model,
+        )
+        atexit.register(self._handle_program_exit)
         self._report_service.start()
 
     def _set_storage_uri(self, value):
@@ -211,21 +311,36 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
             self._max_iteration = max(self._max_iteration, ev_iteration + self._metrics.get_iteration_offset())
         self._report_service.add_event(ev)
 
+    def _handle_program_exit(self):
+        try:
+            self.flush()
+            self.wait_for_events()
+            self.stop()
+        except Exception as e:
+            logging.getLogger("clearml.reporter").warning(
+                "Exception encountered cleaning up the reporter: {}".format(e)
+            )
+
     def flush(self):
         """
         Flush cached reports to backend.
         """
-        if self._report_service:
-            self._report_service.flush()
+        # we copy this value for thread safety
+        report_service = self._report_service
+        if report_service:
+            report_service.flush()
 
     def wait_for_events(self, timeout=None):
-        if self._report_service:
-            return self._report_service.wait_for_events(timeout=timeout)
+        # we copy this value for thread safety
+        report_service = self._report_service
+        if report_service:
+            return report_service.wait_for_events(timeout=timeout)
 
     def stop(self):
-        if not self._report_service:
-            return
+        # save the report service and allow multiple threads to access it
         report_service = self._report_service
+        if not report_service:
+            return
         self._report_service = None
         if not report_service.is_subprocess_mode() or report_service.is_alive():
             report_service.stop()
@@ -235,6 +350,10 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
 
     def is_alive(self):
         return self._report_service and self._report_service.is_alive()
+
+    def is_constructed(self):
+        # noinspection PyProtectedMember
+        return self._report_service and (self._report_service.is_alive() or self._report_service._thread is True)
 
     def get_num_results(self):
         return self._report_service.get_num_results()
@@ -257,8 +376,12 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         :param iter: Iteration number
         :type iter: int
         """
-        ev = ScalarEvent(metric=self._normalize_name(title), variant=self._normalize_name(series), value=value,
-                         iter=iter)
+        ev = ScalarEvent(
+            metric=self._normalize_name(title),
+            variant=self._normalize_name(series),
+            value=value,
+            iter=iter
+        )
         self._report(ev)
 
     def report_vector(self, title, series, values, iter):
@@ -359,8 +482,12 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         elif not isinstance(plot, six.string_types):
             raise ValueError('Plot should be a string or a dict')
 
-        ev = PlotEvent(metric=self._normalize_name(title), variant=self._normalize_name(series),
-                       plot_str=plot, iter=iter)
+        ev = PlotEvent(
+            metric=self._normalize_name(title),
+            variant=self._normalize_name(series),
+            plot_str=plot,
+            iter=iter
+        )
         self._report(ev)
 
     def report_image(self, title, series, src, iter):
@@ -467,7 +594,7 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         self._report(ev)
 
     def report_histogram(self, title, series, histogram, iter, labels=None, xlabels=None,
-                         xtitle=None, ytitle=None, comment=None, mode='group', layout_config=None):
+                         xtitle=None, ytitle=None, comment=None, mode='group', data_args=None, layout_config=None):
         """
         Report an histogram bar plot
         :param title: Title (AKA metric)
@@ -489,6 +616,8 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         :type comment: str
         :param mode: multiple histograms mode. valid options are: stack / group / relative. Default is 'group'.
         :type mode: str
+        :param data_args: optional dictionary for data configuration, passed directly to plotly
+        :type data_args: dict or None
         :param layout_config: optional dictionary for layout configuration, passed directly to plotly
         :type layout_config: dict or None
         """
@@ -504,6 +633,7 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
             xlabels=xlabels,
             comment=comment,
             mode=mode,
+            data_args=data_args,
             layout_config=layout_config,
         )
 
@@ -515,7 +645,7 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
             nan_as_null=False,
         )
 
-    def report_table(self, title, series, table, iteration, layout_config=None):
+    def report_table(self, title, series, table, iteration, layout_config=None, data_config=None):
         """
         Report a table plot.
 
@@ -529,8 +659,10 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         :type iteration: int
         :param layout_config: optional dictionary for layout configuration, passed directly to plotly
         :type layout_config: dict or None
+        :param data_config: optional dictionary for data configuration, like column width, passed directly to plotly
+        :type data_config: dict or None
         """
-        table_output = create_plotly_table(table, title, series, layout_config=layout_config)
+        table_output = create_plotly_table(table, title, series, layout_config=layout_config, data_config=data_config)
         return self.report_plot(
             title=self._normalize_name(title),
             series=self._normalize_name(series),
@@ -557,7 +689,7 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         :type ytitle: str
         :param mode: 'lines' / 'markers' / 'lines+markers'
         :type mode: str
-        :param reverse_xaxis: If true X axis will be displayed from high to low (reversed)
+        :param reverse_xaxis: If True, X axis will be displayed from high to low (reversed)
         :type reverse_xaxis: bool
         :param comment: comment underneath the title
         :type comment: str
@@ -714,7 +846,7 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         :param str ytitle: optional y-axis title
         :param xlabels: optional label per column of the matrix
         :param ylabels: optional label per row of the matrix
-        :param bool yaxis_reversed: If False 0,0 is at the bottom left corner. If True 0,0 is at the Top left corner
+        :param bool yaxis_reversed: If False, 0,0 is at the bottom left corner. If True, 0,0 is at the top left corner
         :param comment: comment underneath the title
         :param layout_config: optional dictionary for layout configuration, passed directly to plotly
         :type layout_config: dict or None

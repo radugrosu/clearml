@@ -4,12 +4,47 @@ import logging
 import logging.handlers
 import os
 import sys
+from os import getenv
 from platform import system
+from typing import Optional, Union
 
 from pathlib2 import Path
 from six import BytesIO
 
 default_level = logging.INFO
+
+_levelToName = {
+    logging.CRITICAL: 'CRITICAL',
+    logging.ERROR: 'ERROR',
+    logging.WARNING: 'WARNING',
+    logging.INFO: 'INFO',
+    logging.DEBUG: 'DEBUG',
+    logging.NOTSET: 'NOTSET',
+}
+
+_nameToLevel = {
+    'CRITICAL': logging.CRITICAL,
+    'FATAL': logging.FATAL,
+    'ERROR': logging.ERROR,
+    'WARN': logging.WARNING,
+    'WARNING': logging.WARNING,
+    'INFO': logging.INFO,
+    'DEBUG': logging.DEBUG,
+    'NOTSET': logging.NOTSET,
+}
+
+
+def resolve_logging_level(level):
+    # type: (Union[str, int]) -> Optional[int]
+    # noinspection PyBroadException
+    try:
+        level = int(level)
+    except Exception:
+        pass
+    if isinstance(level, str):
+        return _nameToLevel.get(level.upper(), None)
+    if level in _levelToName:
+        return level
 
 
 class PickledLogger(logging.getLoggerClass()):
@@ -60,39 +95,31 @@ class LoggerRoot(object):
     __base_logger = None
 
     @classmethod
-    def _make_stream_handler(cls, level=None, stream=sys.stdout, colored=False):
-        ch = logging.StreamHandler(stream=stream)
-        ch.setLevel(level)
-        formatter = None
-
-        # if colored, try to import colorama & coloredlogs (by default, not in the requirements)
-        if colored:
-            try:
-                import colorama
-                from coloredlogs import ColoredFormatter
-                colorama.init()
-                formatter = ColoredFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            except ImportError:
-                colored = False
-
-        # if we don't need or failed getting colored formatter
-        if not colored or not formatter:
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-        ch.setFormatter(formatter)
-        return ch
-
-    @classmethod
     def get_base_logger(cls, level=None, stream=sys.stdout, colored=False):
         if LoggerRoot.__base_logger:
             return LoggerRoot.__base_logger
+
+        # Note we can't use LOG_LEVEL_ENV_VAR defined in clearml.config.defs due to a circular dependency
+        if level is None and getenv("CLEARML_LOG_LEVEL"):
+            level = resolve_logging_level(getenv("CLEARML_LOG_LEVEL").strip())
+            if level is None:
+                print('Invalid value in environment variable CLEARML_LOG_LEVEL: %s' % getenv("CLEARML_LOG_LEVEL"))
+
+        clearml_logger = logging.getLogger('clearml')
+
+        if level is None:
+            level = clearml_logger.level
+
         # avoid nested imports
         from ..config import get_log_redirect_level
         LoggerRoot.__base_logger = PickledLogger.wrapper(
-            logging.getLogger('clearml'),
+            clearml_logger,
             func=cls.get_base_logger,
-            level=level, stream=stream, colored=colored)
-        level = level if level is not None else default_level
+            level=level,
+            stream=stream,
+            colored=colored
+        )
+
         LoggerRoot.__base_logger.setLevel(level)
 
         redirect_level = get_log_redirect_level()
@@ -103,17 +130,17 @@ class LoggerRoot(object):
             # and redirect is set for ERROR, in which case we redirect from CRITICAL)
             redirect_level = max(level, redirect_level)
             LoggerRoot.__base_logger.addHandler(
-                cls._make_stream_handler(redirect_level, sys.stderr, colored)
+                ClearmlStreamHandler(redirect_level, sys.stderr, colored)
             )
 
             if level < redirect_level:
                 # Not all levels were redirected, remaining should be sent to requested stream
-                handler = cls._make_stream_handler(level, stream, colored)
+                handler = ClearmlStreamHandler(level, stream, colored)
                 handler.addFilter(_LevelRangeFilter(min_level=level, max_level=redirect_level - 1))
                 LoggerRoot.__base_logger.addHandler(handler)
         else:
             LoggerRoot.__base_logger.addHandler(
-                cls._make_stream_handler(level, stream, colored)
+                ClearmlStreamHandler(level, stream, colored)
             )
 
         LoggerRoot.__base_logger.propagate = False
@@ -124,6 +151,16 @@ class LoggerRoot(object):
         if LoggerRoot.__base_logger:
             for h in LoggerRoot.__base_logger.handlers:
                 h.flush()
+
+    @staticmethod
+    def clear_logger_handlers():
+        # https://github.com/pytest-dev/pytest/issues/5502#issuecomment-647157873
+        loggers = [logging.getLogger()] + list(logging.Logger.manager.loggerDict.values())
+        for logger in loggers:
+            handlers = getattr(logger, 'handlers', [])
+            for handler in handlers:
+                if isinstance(handler, ClearmlLoggerHandler):
+                    logger.removeHandler(handler)
 
 
 def add_options(parser):
@@ -149,14 +186,15 @@ def get_logger(path=None, level=None, stream=None, colored=False):
     except BaseException:
         # if for some reason we could not find the calling file, use our own
         path = os.path.abspath(__file__)
-    root_log = LoggerRoot.get_base_logger(level=default_level, stream=sys.stdout, colored=colored)
+    root_log = LoggerRoot.get_base_logger(stream=sys.stdout, colored=colored)
     log = root_log.getChild(Path(path).stem)
     if level is not None:
         log.setLevel(level)
     if stream:
-        ch = logging.StreamHandler(stream=stream)
+        ch = ClearmlStreamHandler(stream=stream, dont_set_formater=True)
         if level is not None:
             ch.setLevel(level)
+        log.addHandler(ch)
     log.propagate = True
     return PickledLogger.wrapper(
         log, func=get_logger, path=path, level=level, stream=stream, colored=colored)
@@ -175,7 +213,7 @@ def _add_file_handler(logger, log_dir, fh, formatter=None):
 def add_rotating_file_handler(logger, log_dir, log_file_prefix, max_bytes=10 * 1024 * 1024, backup_count=20,
                               formatter=None):
     """ Create and add a rotating file handler to a logger """
-    fh = logging.handlers.RotatingFileHandler(
+    fh = ClearmlRotatingFileHandler(
         str(Path(log_dir) / ('%s.log' % log_file_prefix)), maxBytes=max_bytes, backupCount=backup_count)
     _add_file_handler(logger, log_dir, fh, formatter)
 
@@ -186,7 +224,7 @@ def add_time_rotating_file_handler(logger, log_dir, log_file_prefix, when='midni
         Possible values for when are 'midnight', weekdays ('w0'-'W6', when 0 is Monday), and 's', 'm', 'h' amd 'd' for
             seconds, minutes, hours and days respectively (case-insensitive)
     """
-    fh = logging.handlers.TimedRotatingFileHandler(
+    fh = ClearmlTimedRotatingFileHandler(
         str(Path(log_dir) / ('%s.log' % log_file_prefix)), when=when)
     _add_file_handler(logger, log_dir, fh, formatter)
 
@@ -198,7 +236,7 @@ def get_null_logger(name=None):
         # avoid nested imports
         from ..config import config
 
-        log.addHandler(logging.NullHandler())
+        log.addHandler(ClearmlNullHandler())
         log.propagate = config.get("log.null_log_propagate", False)
     return PickledLogger.wrapper(log, func=get_null_logger, name=name)
 
@@ -236,3 +274,43 @@ class TqdmLog(object):
 
     def close(self):
         self._tqdm.close()
+
+
+class ClearmlLoggerHandler:
+    pass
+
+
+class ClearmlStreamHandler(logging.StreamHandler, ClearmlLoggerHandler):
+    def __init__(self, level=None, stream=sys.stdout, colored=False, dont_set_formater=False):
+        super(ClearmlStreamHandler, self).__init__(stream=stream)
+        self.setLevel(level)
+        if dont_set_formater:
+            return
+
+        formatter = None
+        # if colored, try to import colorama & coloredlogs (by default, not in the requirements)
+        if colored:
+            try:
+                import colorama
+                from coloredlogs import ColoredFormatter
+
+                colorama.init()
+                formatter = ColoredFormatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+            except ImportError:
+                colored = False
+        # if we don't need or failed getting colored formatter
+        if not colored or not formatter:
+            formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        self.setFormatter(formatter)
+
+
+class ClearmlRotatingFileHandler(logging.handlers.RotatingFileHandler, ClearmlLoggerHandler):
+    pass
+
+
+class ClearmlTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler, ClearmlLoggerHandler):
+    pass
+
+
+class ClearmlNullHandler(logging.NullHandler, ClearmlLoggerHandler):
+    pass

@@ -19,6 +19,7 @@ from .backend_interface.logger import StdStreamPatch
 from .backend_interface.task import Task as _Task
 from .backend_interface.task.log import TaskHandler
 from .backend_interface.util import mutually_exclusive
+from .backend_interface.metrics.events import UploadEvent, MetricsEventAdapter
 from .config import running_remotely, get_cache_dir, config, DEBUG_SIMULATE_REMOTE_TASK, deferred_config
 from .errors import UsageError
 from .storage.helper import StorageHelper
@@ -78,17 +79,19 @@ class Logger(object):
             if private_task.is_main_task() or (connect_stdout or connect_stderr or connect_logging) else None
         self._connect_std_streams = connect_stdout or connect_stderr
         self._connect_logging = connect_logging
+        self._default_max_sample_history = None
 
         # Make sure urllib is never in debug/info,
         disable_urllib3_info = config.get('log.disable_urllib3_info', True)
         if disable_urllib3_info and logging.getLogger('urllib3').isEnabledFor(logging.INFO):
             logging.getLogger('urllib3').setLevel(logging.WARNING)
 
-        StdStreamPatch.patch_std_streams(self, connect_stdout=connect_stdout, connect_stderr=connect_stderr)
+        if self._task.is_main_task():
+            StdStreamPatch.patch_std_streams(self, connect_stdout=connect_stdout, connect_stderr=connect_stderr)
 
         if self._connect_logging:
             StdStreamPatch.patch_logging_formatter(self)
-        elif not self._connect_std_streams:
+        elif not self._connect_std_streams and self._task.is_main_task():
             # make sure that at least the main clearml logger is connect
             base_logger = LoggerRoot.get_base_logger()
             if base_logger and base_logger.handlers:
@@ -129,12 +132,11 @@ class Logger(object):
 
         :param str msg: The text to log.
         :param int level: The log level from the Python ``logging`` package. The default value is ``logging.INFO``.
-        :param bool print_console: In addition to the log, print to the console
-
+        :param bool print_console: In addition to the log, print to the console.
             The values are:
 
-            - ``True`` - Print to the console. (default)
-            - ``False`` - Do not print to the console.
+          - ``True`` - Print to the console. (default)
+          - ``False`` - Do not print to the console.
         """
         force_send = not print_console and self._parse_level(level) >= logging.WARNING
         return self._console(msg, level, not print_console, force_send=force_send, *args, **_)
@@ -148,8 +150,12 @@ class Logger(object):
 
         .. code-block:: py
 
+           logger = Logger.current_logger()
            scalar_series = [random.randint(0,10) for i in range(10)]
-           logger.report_scalar(title='scalar metrics','series', value=scalar_series[iteration], iteration=0)
+           for iteration in range(10):
+               logger.report_scalar(
+                   title='scalar metrics', series='series', value=scalar_series[iteration], iteration=iteration
+               )
 
         You can view the scalar plots in the **ClearML Web-App (UI)**, **RESULTS** tab, **SCALARS** sub-tab.
 
@@ -165,6 +171,17 @@ class Logger(object):
         self._touch_title_series(title, series)
         # noinspection PyProtectedMember
         return self._task._reporter.report_scalar(title=title, series=series, value=float(value), iter=iteration)
+
+    def report_single_value(self, name, value):
+        # type: (str, float) -> None
+        """
+        Reports a single value metric (for example, total experiment accuracy or mAP)
+        You can view the metrics in the **ClearML Web-App (UI)**, **RESULTS** tab, **SCALARS** sub-tab.
+
+        :param name: Metric's name
+        :param value: Metric's value
+        """
+        return self.report_scalar(title="Summary", series=name, value=value, iteration=-2**31)
 
     def report_vector(
             self,
@@ -190,7 +207,7 @@ class Logger(object):
            logger.report_vector(title='vector example', series='vector series', values=vector_series, iteration=0,
                 labels=['A','B'], xaxis='X axis label', yaxis='Y axis label')
 
-        You can view the vectors plots in the **ClearML Web-App (UI)**, **RESULTS** tab, **PLOTS** sub-tab.
+        You can view the vectors plot in the **ClearML Web-App (UI)**, **RESULTS** tab, **PLOTS** sub-tab.
 
         :param title: The title (metric) of the plot.
         :param series: The series name (variant) of the reported histogram.
@@ -204,7 +221,8 @@ class Logger(object):
         :param yaxis: The y-axis title. (Optional)
         :param mode: Multiple histograms mode, stack / group / relative. Default is 'group'.
         :param extra_layout: optional dictionary for layout configuration, passed directly to plotly
-            example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
+            See full details on the supported configuration: https://plotly.com/javascript/reference/layout/
+            example: extra_layout={'showlegend': False, 'plot_bgcolor': 'yellow'}
         """
         self._touch_title_series(title, series)
         return self.report_histogram(title, series, values, iteration or 0, labels=labels, xlabels=xlabels,
@@ -221,6 +239,7 @@ class Logger(object):
             xaxis=None,  # type: Optional[str]
             yaxis=None,  # type: Optional[str]
             mode=None,  # type: Optional[str]
+            data_args=None,  # type: Optional[dict]
             extra_layout=None,  # type: Optional[dict]
     ):
         """
@@ -249,7 +268,11 @@ class Logger(object):
         :param xaxis: The x-axis title. (Optional)
         :param yaxis: The y-axis title. (Optional)
         :param mode: Multiple histograms mode, stack / group / relative. Default is 'group'.
+        :param data_args: optional dictionary for data configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/bar/
+            example: data_args={'orientation': 'h', 'marker': {'color': 'blue'}}
         :param extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/bar/
             example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
         """
 
@@ -270,6 +293,7 @@ class Logger(object):
             xtitle=xaxis,
             ytitle=yaxis,
             mode=mode or 'group',
+            data_args=data_args,
             layout_config=extra_layout,
         )
 
@@ -282,6 +306,7 @@ class Logger(object):
             csv=None,  # type: Optional[str]
             url=None,  # type: Optional[str]
             extra_layout=None,  # type: Optional[dict]
+            extra_data=None,  # type: Optional[dict]
     ):
         """
         For explicit report, report a table plot.
@@ -312,7 +337,29 @@ class Logger(object):
         :param csv: path to local csv file
         :param url: A URL to the location of csv file.
         :param extra_layout: optional dictionary for layout configuration, passed directly to plotly
-            example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
+            See full details on the supported configuration: https://plotly.com/javascript/reference/layout/
+            For example:
+
+            .. code block:: py
+            logger.report_table(
+                title='table example',
+                series='pandas DataFrame',
+                iteration=0,
+                table_plot=df,
+                extra_layout={'height': 600})
+
+        :param extra_data: optional dictionary for data configuration, like column width, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/table/
+            For example:
+
+            .. code block:: py
+            logger.report_table(
+                title='table example',
+                series='pandas DataFrame',
+                iteration=0,
+                table_plot=df,
+                extra_data={'columnwidth': [2., 1., 1., 1.]})
+
         """
         mutually_exclusive(
             UsageError, _check_none=True,
@@ -348,6 +395,7 @@ class Logger(object):
             table=reporter_table,
             iteration=iteration or 0,
             layout_config=extra_layout,
+            data_config=extra_data,
         )
 
     def report_line_plot(
@@ -371,22 +419,21 @@ class Logger(object):
         :param str xaxis: The x-axis title. (Optional)
         :param str yaxis: The y-axis title. (Optional)
         :param str mode: The type of line plot.
-
             The values are:
 
-            - ``lines`` (default)
-            - ``markers``
-            - ``lines+markers``
+          - ``lines`` (default)
+          - ``markers``
+          - ``lines+markers``
 
-        :param bool reverse_xaxis: Reverse the x-axis
-
+        :param bool reverse_xaxis: Reverse the x-axis.
             The values are:
 
-            - ``True`` - The x-axis is high to low  (reversed).
-            - ``False`` - The x-axis is low to high  (not reversed). (default)
+          - ``True`` - The x-axis is high to low  (reversed).
+          - ``False`` - The x-axis is low to high  (not reversed). (default)
 
         :param str comment: A comment displayed with the plot, underneath the title.
         :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/scatter/
             example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
         """
 
@@ -454,16 +501,15 @@ class Logger(object):
         :param str yaxis: The y-axis title. (Optional)
         :param list(str) labels: Labels per point in the data assigned to the ``scatter`` parameter. The labels must be
             in the same order as the data.
-        :param str mode: The type of scatter plot.
+        :param str mode: The type of scatter plot. The values are:
 
-            The values are:
-
-            - ``lines``
-            - ``markers``
-            - ``lines+markers``
+          - ``lines``
+          - ``markers``
+          - ``lines+markers``
 
         :param str comment: A comment displayed with the plot, underneath the title.
         :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/scatter/
             example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
         """
 
@@ -517,31 +563,23 @@ class Logger(object):
         :param str zaxis: The z-axis title. (Optional)
         :param list(str) labels: Labels per point in the data assigned to the ``scatter`` parameter. The labels must be
             in the same order as the data.
-        :param str mode: The type of scatter plot.
+        :param str mode: The type of scatter plot. The values are: ``lines``, ``markers``, ``lines+markers``.
+            For example:
 
-            The values are:
+            .. code-block:: py
 
-            - ``lines``
-            - ``markers``
-            - ``lines+markers``
+               scatter3d = np.random.randint(10, size=(10, 3))
+               logger.report_scatter3d(title="example_scatter_3d", series="series_xyz", iteration=1, scatter=scatter3d,
+                    xaxis="title x", yaxis="title y", zaxis="title z")
 
-        For example:
+        :param bool fill: Fill the area under the curve. The values are:
 
-        .. code-block:: py
-
-           scatter3d = np.random.randint(10, size=(10, 3))
-           logger.report_scatter3d(title="example_scatter_3d", series="series_xyz", iteration=1, scatter=scatter3d,
-                xaxis="title x", yaxis="title y", zaxis="title z")
-
-        :param bool fill: Fill the area under the curve
-
-            The values are:
-
-            - ``True`` - Fill
-            - ``False`` - Do not fill (default)
+          - ``True`` - Fill
+          - ``False`` - Do not fill (default)
 
         :param str comment: A comment displayed with the plot, underneath the title.
         :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/scatter3d/
             example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
         """
         # check if multiple series
@@ -619,14 +657,18 @@ class Logger(object):
         :param str yaxis: The y-axis title. (Optional)
         :param list(str) xlabels: Labels for each column of the matrix. (Optional)
         :param list(str) ylabels: Labels for each row of the matrix. (Optional)
-        :param bool yaxis_reversed: If False 0,0 is at the bottom left corner. If True 0,0 is at the Top left corner
+        :param bool yaxis_reversed: If False 0,0 is at the bottom left corner. If True, 0,0 is at the top left corner
         :param str comment: A comment displayed with the plot, underneath the title.
         :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/heatmap/
             example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
         """
 
         if not isinstance(matrix, np.ndarray):
             matrix = np.array(matrix)
+
+        if extra_layout is None:
+            extra_layout = {'texttemplate': '%{z}'}
 
         # if task was not started, we have to start it
         self._start_task_if_needed()
@@ -673,8 +715,9 @@ class Logger(object):
         :param str yaxis: The y-axis title. (Optional)
         :param list(str) xlabels: Labels for each column of the matrix. (Optional)
         :param list(str) ylabels: Labels for each row of the matrix. (Optional)
-        :param bool yaxis_reversed: If False 0,0 is at the bottom left corner. If True 0,0 is at the Top left corner
+        :param bool yaxis_reversed: If False, 0,0 is at the bottom left corner. If True, 0,0 is at the top left corner
         :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/heatmap/
             example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
         """
         self._touch_title_series(title, series)
@@ -723,6 +766,7 @@ class Logger(object):
         :param list(float) camera: X,Y,Z coordinates indicating the camera position. The default value is ``(1,1,1)``.
         :param str comment: A comment displayed with the plot, underneath the title.
         :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/surface/
             example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
         """
 
@@ -790,19 +834,17 @@ class Logger(object):
         :param local_path: A path to an image file.
         :param url: A URL for the location of a pre-uploaded image.
         :param image: Image data (RGB).
-        :param matrix: Deperacted, Image data (RGB).
+        :param matrix: Deprecated, Image data (RGB).
 
             .. note::
                The ``matrix`` parameter is deprecated. Use the ``image`` parameters.
         :param max_image_history: The maximum number of images to store per metric/variant combination.
             For an unlimited number, use a negative value. The default value is set in global configuration
             (default=``5``).
-        :param delete_after_upload: After the upload, delete the local copy of the image
+        :param delete_after_upload: After the upload, delete the local copy of the image. The values are:
 
-            The values are:
-
-            - ``True`` - Delete after upload.
-            - ``False`` - Do not delete after upload. (default)
+          - ``True`` - Delete after upload.
+          - ``False`` - Do not delete after upload. (default)
         """
         mutually_exclusive(
             UsageError, _check_none=True,
@@ -849,7 +891,8 @@ class Logger(object):
                 image=image,
                 iter=iteration or 0,
                 upload_uri=upload_uri,
-                max_image_history=max_image_history,
+                max_image_history=max_image_history if max_image_history is not None
+                else self._default_max_sample_history,
                 delete_after_upload=delete_after_upload,
             )
 
@@ -882,12 +925,12 @@ class Logger(object):
         :param str title: The title (metric) of the media.
         :param str series: The series name (variant) of the reported media.
         :param int iteration: The reported iteration / step.
-        :param str local_path: A path to an media file.
+        :param str local_path: A path to a media file.
         :param stream: BytesIO stream to upload. If provided, ``file_extension`` must also be provided.
         :param str url: A URL to the location of a pre-uploaded media.
         :param file_extension: A file extension to use when ``stream`` is passed.
-        :param int max_history: The maximum number of media files to store per metric/variant combination
-            use negative value for unlimited. default is set in global configuration (default=5)
+        :param int max_history: The maximum number of media files to store per metric/variant combination.
+            Use negative value for unlimited. Default is set in global configuration (default=5)
         :param bool delete_after_upload: After the file is uploaded, delete the local copy
 
             - ``True`` - Delete
@@ -932,7 +975,7 @@ class Logger(object):
                 stream=stream,
                 iter=iteration or 0,
                 upload_uri=upload_uri,
-                max_history=max_history,
+                max_history=max_history if max_history is not None else self._default_max_sample_history,
                 delete_after_upload=delete_after_upload,
                 file_extension=file_extension,
             )
@@ -952,7 +995,7 @@ class Logger(object):
         :param str title: The title (metric) of the plot.
         :param str series: The series name (variant) of the reported plot.
         :param int iteration: The reported iteration / step.
-        :param dict figure: A ``plotly`` Figure object or a ``poltly`` dictionary
+        :param dict figure: A ``plotly`` Figure object or a ``plotly`` dictionary
         """
         # if task was not started, we have to start it
         self._start_task_if_needed()
@@ -991,11 +1034,11 @@ class Logger(object):
         :param str series: The series name (variant) of the reported plot.
         :param int iteration: The reported iteration / step.
         :param MatplotlibFigure figure: A ``matplotlib`` Figure object
-        :param report_image: Default False. If True the plot will be uploaded as a debug sample (png image),
+        :param report_image: Default False. If True, the plot will be uploaded as a debug sample (png image),
             and will appear under the debug samples tab (instead of the Plots tab).
-        :param report_interactive: If True (default) it will try to convert the matplotlib into interactive
-            plot in the UI. If False the matplotlib is saved as is and will
-            be non-interactive (with the exception of zooming in/out)
+        :param report_interactive: If True (default), it will try to convert the matplotlib into interactive
+            plot in the UI. If False, the matplotlib is saved as is and will
+            be non-interactive (except zooming in/out)
         """
         # if task was not started, we have to start it
         self._start_task_if_needed()
@@ -1087,6 +1130,48 @@ class Logger(object):
         """
         pass
 
+    def set_default_debug_sample_history(self, max_history):
+        # type: (int) -> None
+        """
+        Set the default maximum debug sample history when reporting media/debug samples.
+        Overrides the configuration file defaults.
+        When reporting debug samples with the same title/series combination and running iterations,
+        only the last X samples are stored (in other words samples are overwritten).
+        The default history size set with `max_history` is used when calling
+        `report_image`, `report_media` etc. without specifying `max_history`
+
+        :param max_history: Number of samples (files) to store on a unique set of title/series being reported
+            with different iteration counters. This is used to make sure users do not end up exploding storage
+            on server storage side.
+
+            For example the following code sample will store the last 5 images even though
+            we are reporting 100 samples.
+
+            .. code-block:: py
+
+                logger.set_default_debug_sample_history(5)
+                for i in range(100):
+                    logger.report_image(title='image', series='sample', iteration=i, ...)
+
+        :return:
+        """
+        self._default_max_sample_history = int(max_history)
+
+    def get_default_debug_sample_history(self):
+        # type: () -> int
+        """
+        Return the default max debug sample history when reporting media/debug samples.
+        If value was not set specifically, the function returns the configuration file default value.
+
+        :return: default number of samples (files) to store on a unique set of title/series being reported
+            with different iteration counters. This is used to make sure users do not end up exploding storage
+            on server storage side.
+        """
+        if self._default_max_sample_history is not None:
+            return self._default_max_sample_history
+        # noinspection PyProtectedMember
+        return int(UploadEvent._file_history_size)
+
     def report_image_and_upload(
             self,
             title,  # type: str
@@ -1165,14 +1250,40 @@ class Logger(object):
     def matplotlib_force_report_non_interactive(cls, force):
         # type: (bool) -> None
         """
-        If True all matplotlib are always converted to non interactive static plots (images), appearing in under
+        If True, all matplotlib are always converted to non-interactive static plots (images), appearing in under
         the Plots section. If False (default), matplotlib figures are converted into interactive web UI plotly
         figures, in case figure conversion fails, it defaults to non-interactive plots.
 
-        :param force: If True all matplotlib figures are converted automatically to non-interactive plots.
+        :param force: If True, all matplotlib figures are converted automatically to non-interactive plots.
         """
         from clearml.backend_interface.metrics import Reporter
         Reporter.matplotlib_force_report_non_interactive(force=force)
+
+    @classmethod
+    def set_reporting_nan_value(cls, value, warn_period=1000):
+        # type: (float, int) -> None
+        """
+        When a NaN value is encountered, it is reported as a floating value (by default 0) and the user is warned.
+        This function is used to change the value NaN is converted to and the warning period.
+
+        :param value: The value NaN is converted to
+        :param warn_period: Number of times NaN is encountered and converted until the next warning
+        """
+        MetricsEventAdapter.default_nan_value = value
+        MetricsEventAdapter.report_nan_warning_period = warn_period
+
+    @classmethod
+    def set_reporting_inf_value(cls, value, warn_period=1000):
+        # type: (float, int) -> None
+        """
+        When an inf value is encountered, it is reported as a floating value (by default 0) and the user is warned.
+        This function is used to change the value inf is converted to and the warning period.
+
+        :param value: The value inf is converted to
+        :param warn_period: Number of times inf is encountered and converted until the next warning
+        """
+        MetricsEventAdapter.default_inf_value = value
+        MetricsEventAdapter.report_inf_warning_period = warn_period
 
     @classmethod
     def _remove_std_logger(cls):
@@ -1294,7 +1405,7 @@ class Logger(object):
             matrix=matrix,
             iter=iteration or 0,
             upload_uri=upload_uri,
-            max_image_history=max_image_history,
+            max_image_history=max_image_history if max_image_history is not None else self._default_max_sample_history,
             delete_after_upload=delete_after_upload,
         )
 
@@ -1340,7 +1451,7 @@ class Logger(object):
             image=None,
             iter=iteration or 0,
             upload_uri=upload_uri,
-            max_image_history=max_file_history,
+            max_image_history=max_file_history if max_file_history is not None else self._default_max_sample_history,
             delete_after_upload=delete_after_upload,
         )
 

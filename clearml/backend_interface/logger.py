@@ -1,10 +1,10 @@
 import logging
 import sys
-import threading
 from time import time
 
 from ..binding.frameworks import _patched_call  # noqa
 from ..config import running_remotely, config, DEBUG_SIMULATE_REMOTE_TASK
+from ..utilities.process.mp import ForkSafeRLock
 
 
 class StdStreamPatch(object):
@@ -14,13 +14,15 @@ class StdStreamPatch(object):
     _stderr_original_write = None
 
     @staticmethod
-    def patch_std_streams(a_logger, connect_stdout=True, connect_stderr=True):
+    def patch_std_streams(a_logger, connect_stdout=True, connect_stderr=True, load_config_defaults=True):
         if (connect_stdout or connect_stderr) and not PrintPatchLogger.patched and \
                 (not running_remotely() or DEBUG_SIMULATE_REMOTE_TASK.get()):
-            StdStreamPatch._stdout_proxy = PrintPatchLogger(sys.stdout, a_logger, level=logging.INFO) \
-                if connect_stdout else None
-            StdStreamPatch._stderr_proxy = PrintPatchLogger(sys.stderr, a_logger, level=logging.ERROR) \
-                if connect_stderr else None
+            StdStreamPatch._stdout_proxy = PrintPatchLogger(
+                sys.stdout, a_logger, level=logging.INFO, load_config_defaults=load_config_defaults) \
+                if connect_stdout and not sys.stdout.closed else None
+            StdStreamPatch._stderr_proxy = PrintPatchLogger(
+                sys.stderr, a_logger, level=logging.ERROR, load_config_defaults=load_config_defaults) \
+                if connect_stderr and not sys.stderr.closed else None
 
             if StdStreamPatch._stdout_proxy:
                 # noinspection PyBroadException
@@ -174,13 +176,13 @@ class PrintPatchLogger(object):
     Used for capturing and logging stdin and stderr when running in development mode pseudo worker.
     """
     patched = False
-    lock = threading.Lock()
-    recursion_protect_lock = threading.RLock()
+    lock = ForkSafeRLock()
+    recursion_protect_lock = ForkSafeRLock()
     cr_flush_period = None
 
-    def __init__(self, stream, logger=None, level=logging.INFO):
-        if self.__class__.cr_flush_period is None:
-            self.__class__.cr_flush_period = config.get("development.worker.console_cr_flush_period", 0)
+    def __init__(self, stream, logger=None, level=logging.INFO, load_config_defaults=True):
+        if load_config_defaults and PrintPatchLogger.cr_flush_period is None:
+            PrintPatchLogger.cr_flush_period = config.get("development.worker.console_cr_flush_period", 0)
         PrintPatchLogger.patched = True
         self._terminal = stream
         self._log = logger
@@ -197,14 +199,25 @@ class PrintPatchLogger(object):
                 self._test_lr_flush()
 
                 self.lock.acquire()
-                with PrintPatchLogger.recursion_protect_lock:
-                    if hasattr(self._terminal, '_original_write'):
-                        self._terminal._original_write(message)  # noqa
-                    else:
-                        self._terminal.write(message)
+                # noinspection PyBroadException
+                try:
+                    with PrintPatchLogger.recursion_protect_lock:
+                        if hasattr(self._terminal, '_original_write'):
+                            self._terminal._original_write(message)  # noqa
+                        else:
+                            self._terminal.write(message)
+                except Exception:
+                    pass
 
                 do_flush = '\n' in message
+                # check for CR character
                 do_cr = '\r' in message
+                # check for "Escape Arrow-Up" character (tqdm's way of clearing a line)
+                if '\x1b[A' in message:
+                    do_cr = True
+                    # replace it with \r so it is more standard
+                    message = message.replace('\x1b[A', '\r')
+
                 self._cur_line += message
 
                 if not do_flush and do_cr and PrintPatchLogger.cr_flush_period and self._force_lf_flush:
@@ -236,12 +249,30 @@ class PrintPatchLogger(object):
                         # what can we do, nothing
                         pass
         else:
-            if hasattr(self._terminal, '_original_write'):
-                self._terminal._original_write(message)  # noqa
-            else:
-                self._terminal.write(message)
+            # noinspection PyBroadException
+            try:
+                if hasattr(self._terminal, '_original_write'):
+                    self._terminal._original_write(message)  # noqa
+                else:
+                    self._terminal.write(message)
+            except Exception:
+                pass
 
     def connect(self, logger):
+        # refresh if needed
+        if PrintPatchLogger.cr_flush_period is None:
+            PrintPatchLogger.cr_flush_period = config.get("development.worker.console_cr_flush_period", 0)
+
+        # if we had a previous log object, call flush before switching
+        if self._log and hasattr(self._log, '_flush_into_logger'):
+            # since we are not sure how flush should be called, we protect it
+            # noinspection PyBroadException
+            try:
+                # noinspection PyProtectedMember
+                self._log._flush_into_logger(a_future_func=logger)
+            except Exception:
+                pass
+
         self._cur_line = ''
         self._log = logger
 

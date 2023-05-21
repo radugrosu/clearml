@@ -102,7 +102,7 @@ def main():
 
     # Connecting ClearML with the current process,
     # from here on everything is logged automatically
-    task = Task.init(project_name='examples', task_name='pytorch with tensorboard')  # noqa: F841
+    task = Task.init(project_name='examples', task_name='PyTorch with TensorBoard')  # noqa: F841
 
     writer = SummaryWriter('runs')
     writer.add_text('TEXT', 'This is some text', 0)
@@ -131,7 +131,9 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         train(model, epoch, train_loader, args, optimizer, writer)
-        torch.save(model, os.path.join(gettempdir(), 'model{}'.format(epoch)))
+        m = torch.jit.script(model)
+        m.save(os.path.join(gettempdir(), 'model{}'.format(epoch)))
+        #torch.save(model, os.path.join(gettempdir(), 'model{}'.format(epoch)))
     test(model, test_loader, args, optimizer, writer)
 
 

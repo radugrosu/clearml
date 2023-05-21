@@ -2,7 +2,7 @@ import getpass
 import re
 from _socket import gethostname
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any
 
 try:
     from datetime import timezone
@@ -52,14 +52,85 @@ def make_message(s, **kwargs):
     return s % args
 
 
-def get_or_create_project(session, project_name, description=None):
-    res = session.send(projects.GetAllRequest(name=exact_match_regex(project_name), only_fields=['id']))
+def get_existing_project(session, project_name):
+    """Return either the project ID if it exists, an empty string if it doesn't or None if backend request failed."""
+    res = session.send(projects.GetAllRequest(
+        name=exact_match_regex(project_name), only_fields=['id'], search_hidden=True, _allow_extra_fields_=True))
     if not res:
         return None
     if res.response and res.response.projects:
         return res.response.projects[0].id
-    res = session.send(projects.CreateRequest(name=project_name, description=description or ''))
-    return res.response.id
+    return ""
+
+
+def rename_project(session, project_name, new_project_name):
+    # type: (Any, str, str) -> bool
+    """
+    Rename a project
+
+    :param session: Session to send the request through
+    :param project_name: Name of the project you want to rename
+    :param new_project_name: New name for the project
+
+    :return: True if the rename succeded and False otherwise
+    """
+    project_id = get_existing_project(session, project_name)
+    if not project_id:
+        return False
+    res = session.send(projects.UpdateRequest(project=project_id, name=new_project_name))
+    if res and res.response and res.response.updated:
+        return True
+    return False
+
+
+def get_or_create_project(session, project_name, description=None, system_tags=None, project_id=None):
+    # noinspection PyBroadException
+    try:
+        return _get_or_create_project(session, project_name, description=description, system_tags=system_tags, project_id=project_id)
+    except Exception:
+        # we only get here if the following race happens:
+        # imagine there are 2 processes the call `_get_or_create_project` and the project requested doesn't exist.
+        # because it doesn't exist, it needs to be created. the 2 processes will call the `CreateRequest` one after
+        # another, one of which will raise an Exception because the project has already been created.
+        # so we need to retry in this case (the retry should now succeed)
+        return _get_or_create_project(session, project_name, description=description, system_tags=system_tags, project_id=project_id)
+
+
+def _get_or_create_project(session, project_name, description=None, system_tags=None, project_id=None):
+    """Return the ID of an existing project, or if it does not exist, make a new one and return that ID instead."""
+    project_system_tags = []
+    if not project_id:
+        res = session.send(
+            projects.GetAllRequest(
+                name=exact_match_regex(project_name),
+                only_fields=["id", "system_tags"] if system_tags else ["id"],
+                search_hidden=True,
+                _allow_extra_fields_=True,
+            )
+        )
+        if res and res.response and res.response.projects:
+            project_id = res.response.projects[0].id
+            if system_tags:
+                project_system_tags = res.response.projects[0].system_tags
+
+    if (
+        project_id
+        and system_tags
+        and (not project_system_tags or not set(system_tags).issubset(project_system_tags))
+    ):
+        # set system_tags
+        session.send(
+            projects.UpdateRequest(project=project_id, system_tags=list(set((project_system_tags or []) + system_tags)))
+        )
+
+    if project_id:
+        return project_id
+
+    # project was not found, so create a new one
+    res = session.send(
+        projects.CreateRequest(name=project_name, description=description or "", system_tags=system_tags)
+    )
+    return res.response.id if res else None
 
 
 def get_queue_id(session, queue):
@@ -80,12 +151,20 @@ def get_queue_id(session, queue):
     return None
 
 
+def get_num_enqueued_tasks(session, queue_id):
+    # type: ('Session', str) -> Optional[int] # noqa: F821
+    res = session.send(queues.GetNumEntriesRequest(queue=queue_id))
+    if res and res.response and res.response.num is not None:
+        return res.response.num
+    return None
+
+
 # Hack for supporting windows
 def get_epoch_beginning_of_time(timezone_info=None):
     return datetime(1970, 1, 1).replace(tzinfo=timezone_info if timezone_info else utc_timezone)
 
 
-def get_single_result(entity, query, results, log=None, show_results=10, raise_on_error=True, sort_by_date=True):
+def get_single_result(entity, query, results, log=None, show_results=1, raise_on_error=True, sort_by_date=True):
     if not results:
         if not raise_on_error:
             return None
@@ -96,8 +175,12 @@ def get_single_result(entity, query, results, log=None, show_results=10, raise_o
         if show_results:
             if not log:
                 log = get_logger()
-            log.warning('More than one {entity} found when searching for `{query}`'
-                        ' (showing first {show_results} {entity}s follow)'.format(**locals()))
+            if show_results > 1:
+                log.warning('{num} {entity} found when searching for `{query}`'
+                            ' (showing first {show_results} {entity}s follow)'.format(num=len(results), **locals()))
+            else:
+                log.warning('{num} {entity} found when searching for `{query}`'.format(num=len(results), **locals()))
+
         if sort_by_date:
             relative_time = get_epoch_beginning_of_time()
             # sort results based on timestamp and return the newest one

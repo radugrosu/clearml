@@ -3,11 +3,10 @@ import pickle
 import struct
 import sys
 from functools import partial
-from multiprocessing import Lock, Event as ProcessEvent
-from threading import Thread, Event as TrEvent
+from multiprocessing import Process, Semaphore, Event as ProcessEvent
+from threading import Thread, Event as TrEvent, RLock as ThreadRLock
 from time import sleep, time
 from typing import List, Dict, Optional
-from multiprocessing import Process
 
 import psutil
 from six.moves.queue import Empty, Queue as TrQueue
@@ -29,19 +28,183 @@ except ImportError:
 try:
     from multiprocessing import get_context
 except ImportError:
-    def get_context(*args, **kwargs):
-        return False
+    def get_context(*args, **kwargs):  # noqa
+        import multiprocessing
+        return multiprocessing
+
+
+class _ForkSafeThreadSyncObject(object):
+    __process_lock = get_context("fork" if sys.platform == "linux" else "spawn").Lock()
+
+    @classmethod
+    def _inner_lock(cls):
+        try:
+            # let's agree that 90sec should be enough to get a lock on such a short protected piece of code.
+            # if we failed, we have to assume some deadlock happened
+            # (Python is not very safe with regrades to Process Locks)
+            cls.__process_lock.acquire(block=True, timeout=90)
+        except:  # noqa
+            pass
+
+    @classmethod
+    def _inner_unlock(cls):
+        try:
+            cls.__process_lock.release()
+        except:  # noqa
+            # if we fail to release we might not have locked it in the first place (see timeout)
+            pass
+
+    def __init__(self, functor):
+        self._sync = None
+        self._instance_pid = None
+        self._functor = functor
+
+    def _create(self):
+        # this part is not atomic, and there is not a lot we can do about it.
+        if self._instance_pid != os.getpid() or not self._sync:
+            # Notice! This is NOT atomic, this means the first time accessed, two concurrent calls might
+            # end up overwriting each others, object
+            # even tough it sounds horrible, the worst case in our usage scenario
+            # is the first call usage is not "atomic"
+
+            # Notice the order! we first create the object and THEN update the pid,
+            # this is so whatever happens we Never try to used the old (pre-forked copy) of the synchronization object
+            try:
+                self._inner_lock()
+
+                # we have to check gain inside the protected locked area
+                if self._instance_pid != os.getpid() or not self._sync:
+                    self._sync = self._functor()
+                    self._instance_pid = os.getpid()
+            finally:
+                self._inner_unlock()
+
+
+class ForkSafeRLock(_ForkSafeThreadSyncObject):
+    def __init__(self):
+        super(ForkSafeRLock, self).__init__(ThreadRLock)
+
+    def acquire(self, *args, **kwargs):
+        self._create()
+        return self._sync.acquire(*args, **kwargs)
+
+    def release(self, *args, **kwargs):
+        if self._sync is None:
+            return None
+        self._create()
+        return self._sync.release(*args, **kwargs)
+
+    def __enter__(self):
+        """Return `self` upon entering the runtime context."""
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """Raise any exception triggered within the runtime context."""
+        # Do whatever cleanup.
+        self.release()
+
+    def _is_owned(self):
+        self._create()
+        return self._sync._is_owned()  # noqa
+
+
+class ForkSemaphore(_ForkSafeThreadSyncObject):
+    def __init__(self, value=1):
+        super(ForkSemaphore, self).__init__(functor=partial(Semaphore, value))
+
+    def acquire(self, *args, **kwargs):
+        try:
+            self._create()
+        except BaseException:  # noqa
+            return None
+
+        return self._sync.acquire(*args, **kwargs)
+
+    def release(self, *args, **kwargs):
+        if self._sync is None:
+            return None
+        self._create()
+        return self._sync.release(*args, **kwargs)
+
+    def get_value(self):
+        self._create()
+        return self._sync.get_value()
+
+    def __enter__(self):
+        """Return `self` upon entering the runtime context."""
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """Raise any exception triggered within the runtime context."""
+        # Do whatever cleanup.
+        self.release()
+
+
+class ForkEvent(_ForkSafeThreadSyncObject):
+    def __init__(self):
+        super(ForkEvent, self).__init__(TrEvent)
+
+    def set(self):
+        self._create()
+        return self._sync.set()
+
+    def clear(self):
+        if self._sync is None:
+            return None
+        self._create()
+        return self._sync.clear()
+
+    def is_set(self):
+        self._create()
+        return self._sync.is_set()
+
+    def wait(self, *args, **kwargs):
+        self._create()
+        return self._sync.wait(*args, **kwargs)
+
+
+class ForkQueue(_ForkSafeThreadSyncObject):
+    def __init__(self):
+        super(ForkQueue, self).__init__(TrQueue)
+
+    def get(self, *args, **kwargs):
+        self._create()
+        return self._sync.get(*args, **kwargs)
+
+    def put(self, *args, **kwargs):
+        self._create()
+        return self._sync.put(*args, **kwargs)
+
+    def empty(self):
+        if not self._sync:
+            return True
+        self._create()
+        return self._sync.empty()
+
+    def full(self):
+        if not self._sync:
+            return False
+        self._create()
+        return self._sync.full()
+
+    def close(self):
+        if not self._sync:
+            return
+        self._create()
+        return self._sync.close()
 
 
 class ThreadCalls(object):
     def __init__(self):
-        self._queue = TrQueue()
+        self._queue = ForkQueue()
         self._thread = Thread(target=self._worker)
         self._thread.daemon = True
         self._thread.start()
 
     def is_alive(self):
-        return bool(self._thread)
+        return bool(self._thread) and self._thread.is_alive()
 
     def apply_async(self, func, args=None):
         if not func:
@@ -49,14 +212,18 @@ class ThreadCalls(object):
         self._queue.put((func, args))
         return True
 
-    def close(self):
-        if not self._thread:
-            return
+    def close(self, timeout=5.):
         t = self._thread
-        # push something into queue so it knows this is the end
-        self._queue.put(None)
-        # wait fot thread
-        t.join()
+        if not t:
+            return
+        try:
+            # push something into queue so it knows this is the end
+            self._queue.put(None)
+            # wait fot thread it should not take long, so we have a 5 second timeout
+            # the background thread itself is doing nothing but push into a queue, so it should not take long
+            t.join(timeout=timeout)
+        except BaseException:  # noqa
+            pass
         # mark thread is done
         self._thread = None
 
@@ -70,12 +237,13 @@ class ThreadCalls(object):
                 continue
             # noinspection PyBroadException
             try:
-                if request[1]:
+                if request[1] is not None:
                     request[0](*request[1])
                 else:
                     request[0]()
             except Exception:
                 pass
+        self._thread = None
 
 
 class SingletonThreadPool(object):
@@ -98,7 +266,7 @@ class SingletonThreadPool(object):
 
     @classmethod
     def is_active(cls):
-        return cls.__thread_pool and cls.__thread_pool.is_alive()
+        return cls.__thread_pool and cls.__thread_pool_pid == os.getpid() and cls.__thread_pool.is_alive()
 
 
 class SafeQueue(object):
@@ -110,8 +278,9 @@ class SafeQueue(object):
     def __init__(self, *args, **kwargs):
         self._reader_thread = None
         self._reader_thread_started = False
+        # Fix the python Queue and Use SimpleQueue write so it uses a single OS write,
+        # making it atomic message passing
         self._q = SimpleQueue(*args, **kwargs)
-        # Fix the simple queue write so it uses a single OS write, making it atomic message passing
         # noinspection PyBroadException
         try:
             # noinspection PyUnresolvedReferences,PyProtectedMember
@@ -119,7 +288,8 @@ class SafeQueue(object):
         except Exception:
             pass
         self._internal_q = None
-        self._q_size = 0
+        # Note we should Never! assign a new object to `self._q_size`, just work with the initial object
+        self._q_size = []  # list of PIDs we pushed, so this is atomic.
 
     def empty(self):
         return self._q.empty() and (not self._internal_q or self._internal_q.empty())
@@ -127,19 +297,27 @@ class SafeQueue(object):
     def is_pending(self):
         # check if we have pending requests to be pushed (it does not mean they were pulled)
         # only call from main put process
-        return self._q_size > 0
+        return self._get_q_size_len() > 0
 
-    def close(self, event, timeout=100.0):
+    def close(self, event, timeout=3.0):
         # wait until all pending requests pushed
         tic = time()
+        pid = os.getpid()
+        prev_q_size = self._get_q_size_len(pid)
         while self.is_pending():
             if event:
                 event.set()
             if not self.__thread_pool.is_active():
                 break
             sleep(0.1)
+            # timeout is for the maximum time to pull a single object from the queue,
+            # this way if we get stuck we notice quickly and abort
             if timeout and (time()-tic) > timeout:
-                break
+                if prev_q_size == self._get_q_size_len(pid):
+                    break
+                else:
+                    prev_q_size = self._get_q_size_len(pid)
+                    tic = time()
 
     def get(self, *args, **kwargs):
         return self._get_internal_queue(*args, **kwargs)
@@ -162,20 +340,46 @@ class SafeQueue(object):
         return buffer
 
     def put(self, obj):
+        # not atomic when forking for the first time
         # GIL will make sure it is atomic
-        self._q_size += 1
-        # make sure the block put is done in the thread pool i.e. in the background
-        obj = pickle.dumps(obj)
-        self.__thread_pool.get().apply_async(self._q_put, args=(obj, ))
+        self._q_size.append(os.getpid())
+        try:
+            # make sure the block put is done in the thread pool i.e. in the background
+            obj = pickle.dumps(obj)
+            if BackgroundMonitor.get_at_exit_state():
+                self._q_put(obj)
+                return
+            self.__thread_pool.get().apply_async(self._q_put, args=(obj, False))
+        except:  # noqa
+            pid = os.getpid()
+            p = None
+            while p != pid and self._q_size:
+                p = self._q_size.pop()
 
-    def _q_put(self, obj):
-        self._q.put(obj)
+    def _get_q_size_len(self, pid=None):
+        pid = pid or os.getpid()
+        return len([p for p in self._q_size if p == pid])
+
+    def _q_put(self, obj, allow_raise=True):
+        # noinspection PyBroadException
+        try:
+            self._q.put(obj)
+        except BaseException:
+            # make sure we zero the _q_size of the process dies (i.e. queue put fails)
+            self._q_size.clear()
+            if allow_raise:
+                raise
+            return
+        pid = os.getpid()
         # GIL will make sure it is atomic
-        self._q_size -= 1
+        # pop the First "counter" that is ours (i.e. pid == os.getpid())
+        p = None
+        while p != pid and self._q_size:
+            p = self._q_size.pop()
 
     def _init_reader_thread(self):
         if not self._internal_q:
-            self._internal_q = TrQueue()
+            self._internal_q = ForkQueue()
         if not self._reader_thread or not self._reader_thread.is_alive():
             # read before we start the thread
             self._reader_thread = Thread(target=self._reader_daemon)
@@ -259,7 +463,7 @@ class SingletonLock(AbstractContextManager):
 
     def create(self):
         if self._lock is None:
-            self._lock = Lock()
+            self._lock = ForkSafeRLock()
 
     @classmethod
     def instantiate(cls):
@@ -275,26 +479,27 @@ class SingletonLock(AbstractContextManager):
         """Raise any exception triggered within the runtime context."""
         # Do whatever cleanup.
         self.release()
-        if any((exc_type, exc_value, traceback,)):
-            raise (exc_type, exc_value, traceback)
 
 
 class BackgroundMonitor(object):
-    # If we will need multiple monitoring contexts (i.e. subprocesses) this will become a dict
+    # If we need multiple monitoring contexts (i.e. subprocesses) this will become a dict
     _main_process = None
+    _main_process_proc_obj = None
     _main_process_task_id = None
     _parent_pid = None
     _sub_process_started = None
+    _at_exit = False
     _instances = {}  # type: Dict[int, List[BackgroundMonitor]]
 
-    def __init__(self, task, wait_period):
-        self._event = TrEvent()
-        self._done_ev = TrEvent()
-        self._start_ev = TrEvent()
+    def __init__(self, task, wait_period, for_model=False):
+        self._event = ForkEvent()
+        self._done_ev = ForkEvent()
+        self._start_ev = ForkEvent()
         self._task_pid = os.getpid()
         self._thread = None
+        self._thread_pid = None
         self._wait_timeout = wait_period
-        self._subprocess = None if task.is_main_task() else False
+        self._subprocess = None if not for_model and task.is_main_task() else False
         self._task_id = task.id
         self._task_obj_id = id(task.id)
 
@@ -314,12 +519,15 @@ class BackgroundMonitor(object):
     def wait(self, timeout=None):
         if not self._done_ev:
             return
-        self._done_ev.wait(timeout=timeout)
+        if not self.is_subprocess_mode() or self.is_subprocess_mode_and_parent_process():
+            self._done_ev.wait(timeout=timeout)
 
     def _start(self):
         # if we already started do nothing
         if isinstance(self._thread, Thread):
-            return
+            if self._thread_pid == os.getpid():
+                return
+        self._thread_pid = os.getpid()
         self._thread = Thread(target=self._daemon)
         self._thread.daemon = True
         self._thread.start()
@@ -328,7 +536,8 @@ class BackgroundMonitor(object):
         if not self._thread:
             return
 
-        if not self.is_subprocess_mode() or self.is_subprocess_alive():
+        if not self._is_subprocess_mode_and_not_parent_process() and (
+                not self.is_subprocess_mode() or self.is_subprocess_alive()):
             self._event.set()
 
         if isinstance(self._thread, Thread):
@@ -336,7 +545,7 @@ class BackgroundMonitor(object):
                 self._get_instances().remove(self)
             except ValueError:
                 pass
-            self._thread = None
+            self._thread = False
 
     def daemon(self):
         while True:
@@ -346,9 +555,11 @@ class BackgroundMonitor(object):
 
     def _daemon(self):
         self._start_ev.set()
-        self.daemon()
-        self.post_execution()
-        self._thread = None
+        try:
+            self.daemon()
+        finally:
+            self.post_execution()
+            self._thread = False
 
     def post_execution(self):
         self._done_ev.set()
@@ -384,11 +595,13 @@ class BackgroundMonitor(object):
             for d in BackgroundMonitor._instances.get(id(task.id), []):
                 d.set_subprocess_mode()
 
-            # todo: solve for standalone spawn subprocess
-            if ForkContext is not None and isinstance(get_context(), ForkContext):
-                cls.__start_subprocess_forkprocess(task_obj_id=id(task.id))
-            else:
-                cls.__start_subprocess_os_fork(task_obj_id=id(task.id))
+            # ToDo: solve for standalone spawn subprocess
+            # prefer os.fork, because multipprocessing.Process add atexit callback, which might later be invalid.
+            cls.__start_subprocess_os_fork(task_obj_id=id(task.id))
+            # if ForkContext is not None and isinstance(get_context(), ForkContext):
+            #     cls.__start_subprocess_forkprocess(task_obj_id=id(task.id))
+            # else:
+            #     cls.__start_subprocess_os_fork(task_obj_id=id(task.id))
 
             # wait until subprocess is up
             if wait_for_subprocess:
@@ -402,10 +615,19 @@ class BackgroundMonitor(object):
         if BackgroundMonitor._main_process == 0:
             # update to the child process pid
             BackgroundMonitor._main_process = os.getpid()
+            BackgroundMonitor._main_process_proc_obj = psutil.Process(BackgroundMonitor._main_process)
             cls._background_process_start(*process_args)
             # force to leave the subprocess
             leave_process(0)
             return
+
+        # update main process object (we are now in the parent process, and we update on the child's subprocess pid)
+        # noinspection PyBroadException
+        try:
+            BackgroundMonitor._main_process_proc_obj = psutil.Process(BackgroundMonitor._main_process)
+        except Exception:
+            # if we fail for some reason, do not crash, switch to thread mode when you can
+            BackgroundMonitor._main_process_proc_obj = None
 
     @classmethod
     def __start_subprocess_forkprocess(cls, task_obj_id):
@@ -435,6 +657,7 @@ class BackgroundMonitor(object):
                     continue
                 raise
         BackgroundMonitor._main_process = _main_process.pid
+        BackgroundMonitor._main_process_proc_obj = psutil.Process(BackgroundMonitor._main_process)
         if un_daemonize:
             # noinspection PyBroadException
             try:
@@ -449,6 +672,7 @@ class BackgroundMonitor(object):
         is_debugger_running = bool(getattr(sys, 'gettrace', None) and sys.gettrace())
         # make sure we update the pid to our own
         cls._main_process = os.getpid()
+        cls._main_process_proc_obj = psutil.Process(cls._main_process)
         # restore original signal, this will prevent any deadlocks
         # Do not change the exception we need to catch base exception as well
         # noinspection PyBroadException
@@ -481,7 +705,12 @@ class BackgroundMonitor(object):
         for i in instances:
             # DO NOT CHANGE, we need to catch base exception, if the process gte's killed
             try:
-                while i._thread and i._thread.is_alive():
+                while i._thread is None or (i._thread and i._thread.is_alive()):
+                    # thread is still not up
+                    if i._thread is None:
+                        sleep(0.1)
+                        continue
+
                     # noinspection PyBroadException
                     try:
                         p = psutil.Process(parent_pid)
@@ -505,11 +734,29 @@ class BackgroundMonitor(object):
         return
 
     def is_alive(self):
-        if self.is_subprocess_mode():
-            return self.is_subprocess_alive() and self._thread \
-                   and self._start_ev.is_set() and not self._done_ev.is_set()
-        else:
+        if not self.is_subprocess_mode():
             return isinstance(self._thread, Thread) and self._thread.is_alive()
+
+        if self.get_at_exit_state():
+            return self.is_subprocess_alive() and self._thread
+
+        return self.is_subprocess_alive() and \
+            self._thread and \
+            self._start_ev.is_set() and \
+            not self._done_ev.is_set()
+
+    @classmethod
+    def _fast_is_subprocess_alive(cls):
+        if not cls._main_process_proc_obj:
+            return False
+        # we have to assume the process actually exists, so we optimize for
+        # just getting the object and status.
+        # noinspection PyBroadException
+        try:
+            return cls._main_process_proc_obj.is_running() and \
+                   cls._main_process_proc_obj.status() != psutil.STATUS_ZOMBIE
+        except Exception:
+            return False
 
     @classmethod
     def is_subprocess_alive(cls, task=None):
@@ -544,6 +791,16 @@ class BackgroundMonitor(object):
     def _is_subprocess_mode_and_not_parent_process(self):
         return self.is_subprocess_mode() and self._parent_pid != os.getpid()
 
+    def is_subprocess_mode_and_parent_process(self):
+        return self.is_subprocess_mode() and self._parent_pid == os.getpid()
+
+    def _is_thread_mode_and_not_main_process(self):
+        if self.is_subprocess_mode():
+            return False
+        from ... import Task
+        # noinspection PyProtectedMember
+        return Task._Task__is_subprocess()
+
     @classmethod
     def is_subprocess_enabled(cls, task=None):
         return bool(cls._main_process) and (not task or task.id == cls._main_process_task_id)
@@ -554,6 +811,7 @@ class BackgroundMonitor(object):
             return
         cls.wait_for_sub_process(task)
         BackgroundMonitor._main_process = None
+        BackgroundMonitor._main_process_proc_obj = None
         BackgroundMonitor._main_process_task_id = None
         BackgroundMonitor._parent_pid = None
         BackgroundMonitor._sub_process_started = None
@@ -571,6 +829,14 @@ class BackgroundMonitor(object):
         tic = time()
         while cls.is_subprocess_alive(task=task) and (not timeout or time()-tic < timeout):
             sleep(0.03)
+
+    @classmethod
+    def set_at_exit_state(cls, state=True):
+        cls._at_exit = bool(state)
+
+    @classmethod
+    def get_at_exit_state(cls):
+        return cls._at_exit
 
 
 def leave_process(status=0):

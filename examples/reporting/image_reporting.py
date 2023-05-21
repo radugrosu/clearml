@@ -17,7 +17,7 @@ def report_debug_images(logger, iteration=0):
     """
 
     # report image as float image
-    m = np.eye(256, 256, dtype=np.float)
+    m = np.eye(256, 256, dtype=float)
     logger.report_image("image", "image float", iteration=iteration, image=m)
 
     # report image as uint8
@@ -29,7 +29,7 @@ def report_debug_images(logger, iteration=0):
     logger.report_image("image", "image color red", iteration=iteration, image=m)
 
     # report PIL Image object
-    image_open = Image.open(os.path.join("data_samples", "picasso.jpg"))
+    image_open = Image.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_samples", "picasso.jpg"))
     logger.report_image("image", "image PIL", iteration=iteration, image=image_open)
 
     # Image can be uploaded via 'report_media' too.
@@ -37,7 +37,7 @@ def report_debug_images(logger, iteration=0):
         "image",
         "image with report media",
         iteration=iteration,
-        local_path=os.path.join("data_samples", "picasso.jpg"),
+        local_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_samples", "picasso.jpg"),
         file_extension="jpg",
     )
 
@@ -45,7 +45,7 @@ def report_debug_images(logger, iteration=0):
 def main():
     # Connecting ClearML with the current process,
     # from here on everything is logged automatically
-    task = Task.init(project_name="examples", task_name="image reporting")
+    task = Task.init(project_name="examples", task_name="Image reporting")
 
     print('reporting a few debug images')
 

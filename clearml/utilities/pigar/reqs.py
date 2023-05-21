@@ -320,6 +320,9 @@ def is_std_or_local_lib(name):
                 return True
             return False
         mpath = module_info.origin
+        # this is a subpackage
+        if not mpath and module_info.loader is not None:
+            return False
         # this is std
         if mpath == 'built-in':
             mpath = None
@@ -360,6 +363,12 @@ def get_installed_pkgs_detail():
     if 'tensorflow_gpu' in mapping:
         mapping['tensorflow'] = mapping['tensorflow_gpu']
 
+    # HACK: prefer tensorflow_macos over tensorflow
+    if 'tensorflow_macos' in mapping:
+        p = mapping.pop('tensorflow_macos', None)
+        if p and isinstance(p, (tuple, list)) and len(p) == 2:
+            mapping['tensorflow'] = ('tensorflow', p[1])
+
     return mapping
 
 
@@ -380,6 +389,11 @@ def _search_path(path):
 
     for file in os.listdir(path):
         # Install from PYPI.
+
+        # broken pip packages might start with '~' - ignore it
+        if str(file).startswith('~'):
+            continue
+
         if fnmatch.fnmatch(file, '*-info'):
             pkg_name, version = file.split('-')[:2]
             if version.endswith('dist'):
@@ -395,19 +409,30 @@ def _search_path(path):
                 # noinspection PyBroadException
                 try:
                     with open(git_direct_json, 'r') as f:
-                        vcs_info = json.load(f)
+                        direct_json = json.load(f)
 
-                    if 'vcs_info' in vcs_info:
+                    if 'vcs_info' in direct_json:
+                        vcs_info = direct_json['vcs_info']
                         git_url = '{vcs}+{url}@{commit}#egg={package}'.format(
-                            vcs=vcs_info['vcs_info']['vcs'], url=vcs_info['url'],
-                            commit=vcs_info['vcs_info']['commit_id'], package=pkg_name)
+                            vcs=vcs_info['vcs'], url=direct_json['url'],
+                            commit=vcs_info['commit_id'], package=pkg_name)
+                        # If subdirectory is present, append this to the git_url
+                        if 'subdirectory' in direct_json:
+                            git_url = '{git_url}&subdirectory={subdirectory}'.format(
+                                git_url=git_url, subdirectory=direct_json['subdirectory'])
                         # Bugfix: package name should be the URL link, because we need it unique
                         # mapping[pkg_name] = ('-e', git_url)
                         pkg_name, version = '-e {}'.format(git_url), ''
-                    elif 'url' in vcs_info:
-                        url_link = vcs_info.get('url', '').strip().lower()
+                    elif 'url' in direct_json:
+                        url_link = direct_json.get('url', '').strip().lower()
                         if url_link and not url_link.startswith('file://'):
-                            pkg_name, version = vcs_info['url'], ''
+                            git_url = direct_json['url']
+                            # If subdirectory is present, append this to the git_url
+                            if 'subdirectory' in direct_json:
+                                git_url = '{git_url}#subdirectory={subdirectory}'.format(
+                                    git_url=direct_json['url'], subdirectory=direct_json['subdirectory'])
+
+                            pkg_name, version = git_url, ''
 
                 except Exception:
                     pass
@@ -421,7 +446,16 @@ def _search_path(path):
                 continue
             with open(top_level, 'r') as f:
                 for line in f:
-                    mapping[line.strip()] = (pkg_name, version)
+                    top_package = line.strip()
+                    # NOTICE: this is a namespace package
+                    if top_package and mapping_pkg_name.startswith("{}_".format(top_package)):
+                        top = mapping.get(top_package, dict())
+                        if not isinstance(top, dict):
+                            top = {top_package: top}
+                        top[mapping_pkg_name] = (pkg_name, version)
+                        mapping[top_package] = top
+                    else:
+                        mapping[top_package] = (pkg_name, version)
 
         # Install from local and available in GitHub.
         elif fnmatch.fnmatch(file, '*-link'):

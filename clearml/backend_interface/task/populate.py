@@ -3,6 +3,7 @@ import json
 import os
 import re
 import tempfile
+from sys import platform
 from functools import reduce
 from logging import getLogger
 from typing import Optional, Sequence, Union, Tuple, List, Callable, Dict, Any
@@ -10,6 +11,7 @@ from typing import Optional, Sequence, Union, Tuple, List, Callable, Dict, Any
 from pathlib2 import Path
 from six.moves.urllib.parse import urlparse
 
+from .args import _Arguments
 from .repo import ScriptInfo
 from ...task import Task
 
@@ -82,8 +84,8 @@ class CreateAndPopulate(object):
         :param base_task_id: Use a pre-existing task in the system, instead of a local repo/script.
             Essentially clones an existing task and overrides arguments/requirements.
         :param add_task_init_call: If True, a 'Task.init()' call is added to the script entry point in remote execution.
-        :param raise_on_missing_entries: If True raise ValueError on missing entries when populating
-        :param verbose: If True print verbose logging
+        :param raise_on_missing_entries: If True, raise ValueError on missing entries when populating
+        :param verbose: If True, print verbose logging
         """
         if repo and len(urlparse(repo).scheme) <= 1 and not re.compile(self._VCS_SSH_REGEX).match(repo):
             folder = repo
@@ -131,7 +133,7 @@ class CreateAndPopulate(object):
         """
         Create the new populated Task
 
-        :param dry_run: Optional, If True do not create an actual Task, instead return the Task definition as dict
+        :param dry_run: Optional, If True, do not create an actual Task, instead return the Task definition as dict
         :return: newly created Task object
         """
         local_entry_file = None
@@ -171,7 +173,7 @@ class CreateAndPopulate(object):
                 name=self.task_name,
                 project=Task.get_project_id(self.project_name),
                 type=str(self.task_type or Task.TaskTypes.training),
-            )
+            )  # type: dict
             if self.output_uri:
                 task_state['output'] = dict(destination=self.output_uri)
         else:
@@ -253,7 +255,7 @@ class CreateAndPopulate(object):
             for line in reqs:
                 if line.strip().startswith('#'):
                     continue
-                package = reduce(lambda a, b: a.split(b)[0], "#;@=~<>", line).strip()
+                package = reduce(lambda a, b: a.split(b)[0], "#;@=~<>[", line).strip()
                 if package == 'clearml':
                     clearml_found = True
                     break
@@ -270,9 +272,14 @@ class CreateAndPopulate(object):
                     "Use --requirements or --packages".format(reqs_txt_file.as_posix()))
 
         if self.add_task_init_call:
-            script_entry = os.path.abspath('/' + task_state['script'].get('working_dir', '.') +
-                                           '/' + task_state['script']['entry_point'])
+            script_entry = ('/' + task_state['script'].get('working_dir', '.')
+                            + '/' + task_state['script']['entry_point'])
+            if platform == "win32":
+                script_entry = os.path.normpath(script_entry).replace('\\', '/')
+            else:
+                script_entry = os.path.abspath(script_entry)
             idx_a = 0
+            lines = None
             # find the right entry for the patch if we have a local file (basically after __future__
             if local_entry_file:
                 with open(local_entry_file, 'rt') as f:
@@ -302,13 +309,19 @@ class CreateAndPopulate(object):
                     "+Task.init()\n" \
                     "+\n".format(
                         script_entry=script_entry, idx_a=idx_a, idx_b=idx_a + 1)
+            elif local_entry_file and lines:
+                # if we are here it means we do not have a git diff, but a single script file
+                init_lines = ["from clearml import Task\n", "Task.init()\n\n"]
+                task_state['script']['diff'] = ''.join(lines[:idx_a] + init_lines + lines[idx_a:])
+                # no need to add anything, we patched it.
+                task_init_patch = ""
             else:
                 # Add Task.init call
                 task_init_patch += \
                     "from clearml import Task\n" \
                     "Task.init()\n\n"
 
-            # make sure we add the dif at the end of the current diff
+            # make sure we add the diff at the end of the current diff
             task_state['script']['diff'] = task_state['script'].get('diff', '')
             if task_state['script']['diff'] and not task_state['script']['diff'].endswith('\n'):
                 task_state['script']['diff'] += '\n'
@@ -458,32 +471,62 @@ class CreateAndPopulate(object):
 
 
 class CreateFromFunction(object):
-    kwargs_section = 'kwargs'
-    input_artifact_section = 'kwargs_artifacts'
-    task_template = """from clearml import Task
+    kwargs_section = "kwargs"
+    return_section = "return"
+    input_artifact_section = "kwargs_artifacts"
+    default_task_template_header = """from clearml import Task
+from clearml import TaskTypes
+from clearml.automation.controller import PipelineDecorator
+"""
+    task_template = """{header}
+from clearml.utilities.proxy_object import get_basic_type
 
+{artifact_serialization_function_source}
+
+{artifact_deserialization_function_source}
 
 {function_source}
 
 if __name__ == '__main__':
-    task = Task.init()
+    task = Task.init(
+        auto_connect_frameworks={auto_connect_frameworks},
+        auto_connect_arg_parser={auto_connect_arg_parser},
+    )
     kwargs = {function_kwargs}
     task.connect(kwargs, name='{kwargs_section}')
     function_input_artifacts = {function_input_artifacts}
     params = task.get_parameters() or dict()
+    return_section = '{return_section}'
     for k, v in params.items():
         if not v or not k.startswith('{input_artifact_section}/'):
             continue
         k = k.replace('{input_artifact_section}/', '', 1)
-        task_id, artifact_name = v.split('.', 1) 
-        kwargs[k] = Task.get_task(task_id=task_id).artifacts[artifact_name].get()
+        task_id, artifact_name = v.split('.', 1)
+        parent_task = Task.get_task(task_id=task_id)
+        if artifact_name in parent_task.artifacts:
+            kwargs[k] = parent_task.artifacts[artifact_name].get(deserialization_function={artifact_deserialization_function_name})
+        else:
+            kwargs[k] = parent_task.get_parameters(cast=True)[return_section + '/' + artifact_name]
     results = {function_name}(**kwargs)
     result_names = {function_return}
     if result_names:
-        if not isinstance(results, (tuple, list)) or (len(result_names) == 1 and len(results) != 1):
+        if not isinstance(results, (tuple, list)) or len(result_names) == 1:
             results = [results]
+        parameters = dict()
+        parameters_types = dict()
         for name, artifact in zip(result_names, results):
-            task.upload_artifact(name=name, artifact_object=artifact) 
+            if type(artifact) in (float, int, bool, str):
+                parameters[return_section + '/' + name] = artifact
+                parameters_types[return_section + '/' + name] = get_basic_type(artifact)
+            else:
+                task.upload_artifact(
+                    name=name,
+                    artifact_object=artifact,
+                    extension_name='.pkl' if isinstance(artifact, dict) else None,
+                    serialization_function={artifact_serialization_function_name}
+                )
+        if parameters:
+            task._set_parameters(parameters, __parameters_types=parameters_types, __update=True)
 """
 
     @classmethod
@@ -496,6 +539,8 @@ if __name__ == '__main__':
             project_name=None,  # type: Optional[str]
             task_name=None,  # type: Optional[str]
             task_type=None,  # type: Optional[str]
+            auto_connect_frameworks=None,  # type: Optional[dict]
+            auto_connect_arg_parser=None,  # type: Optional[dict]
             repo=None,  # type: Optional[str]
             branch=None,  # type: Optional[str]
             commit=None,  # type: Optional[str]
@@ -504,8 +549,13 @@ if __name__ == '__main__':
             docker_args=None,  # type: Optional[str]
             docker_bash_setup_script=None,  # type: Optional[str]
             output_uri=None,  # type: Optional[str]
+            helper_functions=None,  # type: Optional[Sequence[Callable]]
             dry_run=False,  # type: bool
+            task_template_header=None,  # type: Optional[str]
+            artifact_serialization_function=None,  # type: Optional[Callable[[Any], Union[bytes, bytearray]]]
+            artifact_deserialization_function=None,  # type: Optional[Callable[[bytes], Any]]
             _sanitize_function=None,  # type: Optional[Callable[[str], str]]
+            _sanitize_helper_functions=None,  # type: Optional[Callable[[str], str]]
     ):
         # type: (...) -> Optional[Dict, Task]
         """
@@ -535,7 +585,8 @@ if __name__ == '__main__':
         :param a_function: A global function to convert into a standalone Task
         :param function_kwargs: Optional, provide subset of function arguments and default values to expose.
             If not provided automatically take all function arguments & defaults
-        :param function_input_artifacts: Optional, pass input arguments to the function from other Tasks's output artifact.
+        :param function_input_artifacts: Optional, pass input arguments to the function from
+            other Tasks's output artifact.
             Example argument named `numpy_matrix` from Task ID `aabbcc` artifact name `answer`:
             {'numpy_matrix': 'aabbcc.answer'}
         :param function_return: Provide a list of names for all the results.
@@ -544,6 +595,8 @@ if __name__ == '__main__':
         :param task_name: Set the name of the remote task. Required if base_task_id is None.
         :param task_type: Optional, The task type to be created. Supported values: 'training', 'testing', 'inference',
             'data_processing', 'application', 'monitor', 'controller', 'optimizer', 'service', 'qc', 'custom'
+        :param auto_connect_frameworks: Control the frameworks auto connect, see `Task.init` auto_connect_frameworks
+        :param auto_connect_arg_parser: Control the ArgParser auto connect, see `Task.init` auto_connect_arg_parser
         :param repo: Remote URL for the repository to use, OR path to local copy of the git repository
             Example: 'https://github.com/allegroai/clearml.git' or '~/project/repo'
         :param branch: Select specific repository branch/tag (implies the latest commit from the branch)
@@ -558,14 +611,64 @@ if __name__ == '__main__':
             inside the docker before setting up the Task's environment
         :param output_uri: Optional, set the Tasks's output_uri (Storage destination).
             examples: 's3://bucket/folder', 'https://server/' , 'gs://bucket/folder', 'azure://bucket', '/folder/'
-        :param dry_run: If True do not create the Task, but return a dict of the Task's definitions
+        :param helper_functions: Optional, a list of helper functions to make available
+            for the standalone function Task.
+        :param dry_run: If True, do not create the Task, but return a dict of the Task's definitions
+        :param task_template_header: A string placed at the top of the task's code
+        :param artifact_serialization_function: A serialization function that takes one
+            parameter of any type which is the object to be serialized. The function should return
+            a `bytes` or `bytearray` object, which represents the serialized object. All parameter/return
+            artifacts uploaded by the pipeline will be serialized using this function.
+            All relevant imports must be done in this function. For example:
+
+            .. code-block:: py
+
+                def serialize(obj):
+                    import dill
+                    return dill.dumps(obj)
+        :param artifact_deserialization_function: A deserialization function that takes one parameter of type `bytes`,
+            which represents the serialized object. This function should return the deserialized object.
+            All parameter/return artifacts fetched by the pipeline will be deserialized using this function.
+            All relevant imports must be done in this function. For example:
+
+            .. code-block:: py
+
+                def deserialize(bytes_):
+                    import dill
+                    return dill.loads(bytes_)
         :param _sanitize_function: Sanitization function for the function string.
+        :param _sanitize_helper_functions: Sanitization function for the helper function string.
         :return: Newly created Task object
         """
-        function_name = str(a_function.__name__)
-        function_source = inspect.getsource(a_function)
-        if _sanitize_function:
-            function_source = _sanitize_function(function_source)
+        # not set -> equals True
+        if auto_connect_frameworks is None:
+            auto_connect_frameworks = True
+        if auto_connect_arg_parser is None:
+            auto_connect_arg_parser = True
+
+        assert (not auto_connect_frameworks or isinstance(auto_connect_frameworks, (bool, dict)))
+        assert (not auto_connect_arg_parser or isinstance(auto_connect_arg_parser, (bool, dict)))
+
+        function_source, function_name = CreateFromFunction.__extract_function_information(
+            a_function, sanitize_function=_sanitize_function
+        )
+        # add helper functions on top.
+        for f in (helper_functions or []):
+            helper_function_source, _ = CreateFromFunction.__extract_function_information(
+                f, sanitize_function=_sanitize_helper_functions
+            )
+            function_source = helper_function_source + "\n\n" + function_source
+
+        artifact_serialization_function_source, artifact_serialization_function_name = (
+            CreateFromFunction.__extract_function_information(artifact_serialization_function)
+            if artifact_serialization_function
+            else ("", "None")
+        )
+        artifact_deserialization_function_source, artifact_deserialization_function_name = (
+            CreateFromFunction.__extract_function_information(artifact_deserialization_function)
+            if artifact_deserialization_function
+            else ("", "None")
+        )
 
         function_input_artifacts = function_input_artifacts or dict()
         # verify artifact kwargs:
@@ -574,7 +677,8 @@ if __name__ == '__main__':
                 'function_input_artifacts={}, it must in the format: '
                 '{{"argument": "task_id.artifact_name"}}'.format(function_input_artifacts)
             )
-
+        inspect_args = None
+        function_kwargs_types = dict()
         if function_kwargs is None:
             function_kwargs = dict()
             inspect_args = inspect.getfullargspec(a_function)
@@ -595,16 +699,35 @@ if __name__ == '__main__':
                 function_kwargs = {str(k): v for k, v in zip(inspect_defaults_args, inspect_defaults_vals)} \
                     if inspect_defaults_vals else {str(k): None for k in inspect_defaults_args}
 
+        if function_kwargs:
+            if not inspect_args:
+                inspect_args = inspect.getfullargspec(a_function)
+            # inspect_func.annotations[k]
+            if inspect_args.annotations:
+                supported_types = _Arguments.get_supported_types()
+                function_kwargs_types = {
+                    str(k): str(inspect_args.annotations[k].__name__) for k in inspect_args.annotations
+                    if inspect_args.annotations[k] in supported_types}
+
         task_template = cls.task_template.format(
+            header=task_template_header or cls.default_task_template_header,
+            auto_connect_frameworks=auto_connect_frameworks,
+            auto_connect_arg_parser=auto_connect_arg_parser,
             kwargs_section=cls.kwargs_section,
             input_artifact_section=cls.input_artifact_section,
             function_source=function_source,
             function_kwargs=function_kwargs,
             function_input_artifacts=function_input_artifacts,
             function_name=function_name,
-            function_return=function_return)
+            function_return=function_return,
+            return_section=cls.return_section,
+            artifact_serialization_function_source=artifact_serialization_function_source,
+            artifact_serialization_function_name=artifact_serialization_function_name,
+            artifact_deserialization_function_source=artifact_deserialization_function_source,
+            artifact_deserialization_function_name=artifact_deserialization_function_name
+        )
 
-        temp_dir = repo if repo and Path(repo).is_dir() else None
+        temp_dir = repo if repo and os.path.isdir(repo) else None
         with tempfile.NamedTemporaryFile('w', suffix='.py', dir=temp_dir) as temp_file:
             temp_file.write(task_template)
             temp_file.flush()
@@ -639,11 +762,12 @@ if __name__ == '__main__':
                 task['script']['working_dir'] = '.'
                 task['hyperparams'] = {
                     cls.kwargs_section: {
-                        k: dict(section=cls.kwargs_section, name=k, value=str(v))
+                        k: dict(section=cls.kwargs_section, name=k,
+                                value=str(v) if v is not None else '', type=function_kwargs_types.get(k, None))
                         for k, v in (function_kwargs or {}).items()
                     },
                     cls.input_artifact_section: {
-                        k: dict(section=cls.input_artifact_section, name=k, value=str(v))
+                        k: dict(section=cls.input_artifact_section, name=k, value=str(v) if v is not None else '')
                         for k, v in (function_input_artifacts or {}).items()
                     }
                 }
@@ -657,6 +781,55 @@ if __name__ == '__main__':
                     {'{}/{}'.format(cls.input_artifact_section, k): str(v) for k, v in function_input_artifacts}
                     if function_input_artifacts else {}
                 )
-                task.set_parameters(hyper_parameters)
+                __function_kwargs_types = {'{}/{}'.format(cls.kwargs_section, k): v for k, v in function_kwargs_types} \
+                    if function_kwargs_types else None
+                task.set_parameters(hyper_parameters, __parameters_types=__function_kwargs_types)
 
             return task
+
+    @staticmethod
+    def __sanitize_remove_type_hints(function_source):
+        # type: (str) -> str
+        try:
+            import ast
+            try:
+                # available in Python3.9+
+                from ast import unparse
+            except ImportError:
+                from ...utilities.lowlevel.astor_unparse import unparse
+        except ImportError:
+            return function_source
+
+        # noinspection PyBroadException
+        try:
+            class TypeHintRemover(ast.NodeTransformer):
+
+                def visit_FunctionDef(self, node):
+                    # remove the return type definition
+                    node.returns = None
+                    # remove all argument annotations
+                    if node.args.args:
+                        for arg in node.args.args:
+                            arg.annotation = None
+                    return node
+
+            # parse the source code into an AST
+            parsed_source = ast.parse(function_source)
+            # remove all type annotations, function return type definitions
+            # and import statements from 'typing'
+            transformed = TypeHintRemover().visit(parsed_source)
+            # convert the AST back to source code
+            return unparse(transformed).lstrip('\n')
+        except Exception:
+            # just in case we failed parsing.
+            return function_source
+
+    @staticmethod
+    def __extract_function_information(function, sanitize_function=None):
+        # type: (Callable, Optional[Callable]) -> (str, str)
+        function_name = str(function.__name__)
+        function_source = inspect.getsource(function)
+        if sanitize_function:
+            function_source = sanitize_function(function_source)
+        function_source = CreateFromFunction.__sanitize_remove_type_hints(function_source)
+        return function_source, function_name

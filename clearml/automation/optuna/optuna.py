@@ -2,7 +2,8 @@ from time import sleep
 from typing import Any, Optional, Sequence
 
 from ..optimization import Objective, SearchStrategy
-from ..parameters import (DiscreteParameterRange, Parameter, UniformIntegerParameterRange, UniformParameterRange)
+from ..parameters import (DiscreteParameterRange, Parameter, UniformIntegerParameterRange, UniformParameterRange,
+                          LogUniformParameterRange)
 from ...task import Task
 
 try:
@@ -105,9 +106,9 @@ class OptimizerOptuna(SearchStrategy):
     ):
         # type: (...) -> None
         """
-        Initialize am Optuna search strategy optimizer
+        Initialize an Optuna search strategy optimizer
         Optuna performs robust and efficient hyperparameter optimization at scale by combining.
-        Specific hyper-parameter pruning strategy can be selected via `sampler` and `pruner` arguments
+        Specific hyperparameter pruning strategy can be selected via `sampler` and `pruner` arguments
 
         :param str base_task_id: Task ID (str)
         :param list hyper_parameters: list of Parameter objects to optimize over
@@ -193,7 +194,10 @@ class OptimizerOptuna(SearchStrategy):
         # type: () -> dict
         cs = {}
         for p in self._hyper_parameters:
-            if isinstance(p, UniformParameterRange):
+            if isinstance(p, LogUniformParameterRange):
+                hp_type = 'suggest_float'
+                hp_params = dict(low=p.base**p.min_value, high=p.base**p.max_value, log=True, step=None)
+            elif isinstance(p, UniformParameterRange):
                 if p.include_max and p.step_size:
                     hp_type = 'suggest_discrete_uniform'
                     hp_params = dict(low=p.min_value, high=p.max_value, q=p.step_size)

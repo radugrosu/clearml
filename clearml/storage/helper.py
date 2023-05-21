@@ -4,10 +4,13 @@ import errno
 import getpass
 import itertools
 import json
+import mimetypes
 import os
+import platform
 import shutil
 import sys
 import threading
+import uuid
 from abc import ABCMeta, abstractmethod
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
@@ -24,19 +27,22 @@ from _socket import gethostname
 from attr import attrs, attrib, asdict
 from furl import furl
 from pathlib2 import Path
+from requests import codes as requests_codes
 from requests.exceptions import ConnectionError
 from six import binary_type, StringIO
 from six.moves.queue import Queue, Empty
 from six.moves.urllib.parse import urlparse
-from six.moves.urllib.request import url2pathname
 
+from clearml.utilities.requests_toolbelt import MultipartEncoder
 from .callbacks import UploadProgressReport, DownloadProgressReport
 from .util import quote_url
+from ..backend_api.session import Session
 from ..backend_api.utils import get_http_session_with_retry
 from ..backend_config.bucket_config import S3BucketConfigurations, GSBucketConfigurations, AzureContainerConfigurations
 from ..config import config, deferred_config
 from ..debugging import get_logger
 from ..errors import UsageError
+from ..utilities.process.mp import ForkSafeRLock, SafeEvent
 
 
 class StorageError(Exception):
@@ -49,6 +55,7 @@ class DownloadError(Exception):
 
 @six.add_metaclass(ABCMeta)
 class _Driver(object):
+    _file_server_hosts = None
 
     @classmethod
     def get_logger(cls):
@@ -67,7 +74,7 @@ class _Driver(object):
         pass
 
     @abstractmethod
-    def list_container_objects(self, container, ex_prefix, **kwargs):
+    def list_container_objects(self, container, ex_prefix=None, **kwargs):
         pass
 
     @abstractmethod
@@ -93,6 +100,21 @@ class _Driver(object):
     @abstractmethod
     def get_object(self, container_name, object_name, **kwargs):
         pass
+
+    @abstractmethod
+    def exists_file(self, container_name, object_name):
+        pass
+
+    @classmethod
+    def get_file_server_hosts(cls):
+        if cls._file_server_hosts is None:
+            hosts = [Session.get_files_server_host()] + (Session.legacy_file_servers or [])
+            for host in hosts[:]:
+                substituted = StorageHelper._apply_url_substitutions(host)
+                if substituted not in hosts:
+                    hosts.append(substituted)
+            cls._file_server_hosts = hosts
+        return cls._file_server_hosts
 
 
 class StorageHelper(object):
@@ -160,6 +182,10 @@ class StorageHelper(object):
             return self._dest_path
 
         @property
+        def canonized_dest_path(self):
+            return self._canonized_dest_path
+
+        @property
         def extra(self):
             return self._extra
 
@@ -171,12 +197,18 @@ class StorageHelper(object):
         def retries(self):
             return self._retries
 
-        def __init__(self, src_path, dest_path, extra, callback, retries):
+        @property
+        def return_canonized(self):
+            return self._return_canonized
+
+        def __init__(self, src_path, dest_path, canonized_dest_path, extra, callback, retries, return_canonized):
             self._src_path = src_path
             self._dest_path = dest_path
+            self._canonized_dest_path = canonized_dest_path
             self._extra = extra
             self._callback = callback
             self._retries = retries
+            self._return_canonized = return_canonized
 
         def __str__(self):
             return "src=%s" % self.src_path
@@ -184,9 +216,10 @@ class StorageHelper(object):
     _helpers = {}  # cache of helper instances
 
     # global terminate event for async upload threads
-    _terminate = threading.Event()
+    # _terminate = threading.Event()
     _async_upload_threads = set()
     _upload_pool = None
+    _upload_pool_pid = None
 
     # collect all bucket credentials that aren't empty (ignore entries with an empty key or secret)
     _s3_configurations = deferred_config('aws.s3', {}, transform=S3BucketConfigurations.from_config)
@@ -217,7 +250,6 @@ class StorageHelper(object):
 
         :return: A StorageHelper instance.
         """
-
         # Handle URL substitution etc before locating the correct storage driver
         url = cls._canonize_url(url)
 
@@ -225,9 +257,16 @@ class StorageHelper(object):
         base_url = cls._resolve_base_url(url)
 
         instance_key = '%s_%s' % (base_url, threading.current_thread().ident or 0)
+        # noinspection PyBroadException
+        try:
+            configs = kwargs.get("configs")
+            if configs:
+                instance_key += "_{}".format(configs.cache_name)
+        except Exception:
+            pass
 
         force_create = kwargs.pop('__force_create', False)
-        if (instance_key in cls._helpers) and (not force_create):
+        if (instance_key in cls._helpers) and (not force_create) and base_url != "file://":
             return cls._helpers[instance_key]
 
         # Don't canonize URL since we already did it
@@ -245,11 +284,12 @@ class StorageHelper(object):
         return instance
 
     @classmethod
-    def get_local_copy(cls, remote_url):
+    def get_local_copy(cls, remote_url, skip_zero_size_check=False):
         """
         Download a file from remote URL to a local storage, and return path to local copy,
 
         :param remote_url: Remote URL. Example: https://example.com/file.jpg s3://bucket/folder/file.mp4 etc.
+        :param skip_zero_size_check: If True, no error will be raised for files with zero bytes size.
         :return: Path to local copy of the downloaded file. None if error occurred.
         """
         helper = cls.get(remote_url)
@@ -258,11 +298,22 @@ class StorageHelper(object):
         # create temp file with the requested file name
         file_name = '.' + remote_url.split('/')[-1].split(os.path.sep)[-1]
         local_path = mktemp(suffix=file_name)
-        return helper.download_to_file(remote_url, local_path)
+        return helper.download_to_file(remote_url, local_path, skip_zero_size_check=skip_zero_size_check)
 
-    def __init__(self, base_url, url, key=None, secret=None, region=None, verbose=False, logger=None, retries=5,
-                 **kwargs):
-        level = config.get('storage.log.level', None)
+    def __init__(
+        self,
+        base_url,
+        url,
+        key=None,
+        secret=None,
+        region=None,
+        verbose=False,
+        logger=None,
+        retries=5,
+        token=None,
+        **kwargs
+    ):
+        level = config.get("storage.log.level", None)
 
         if level:
             try:
@@ -297,7 +348,7 @@ class StorageHelper(object):
                 )
 
             self._driver = _AzureBlobServiceStorageDriver()
-            self._container = self._driver.get_container(config=self._conf)
+            self._container = self._driver.get_container(config=self._conf, account_url=parsed.netloc)
 
         elif self._scheme == _Boto3Driver.scheme:
             self._conf = copy(self._s3_configurations.get_config_by_uri(url))
@@ -312,7 +363,9 @@ class StorageHelper(object):
                 secret=secret or self._conf.secret,
                 multipart=self._conf.multipart,
                 region=final_region,
-                use_credentials_chain=self._conf.use_credentials_chain
+                use_credentials_chain=self._conf.use_credentials_chain,
+                token=token or self._conf.token,
+                extra_args=self._conf.extra_args,
             )
 
             if not self._conf.use_credentials_chain:
@@ -322,8 +375,8 @@ class StorageHelper(object):
                     )
 
             self._driver = _Boto3Driver()
-            self._container = self._driver.get_container(container_name=self._base_url, retries=retries,
-                                                         config=self._conf)
+            self._container = self._driver.get_container(
+                container_name=self._base_url, retries=retries, config=self._conf)
 
         elif self._scheme == _GoogleCloudStorageDriver.scheme:
             self._conf = copy(self._gs_configurations.get_config_by_uri(url))
@@ -338,26 +391,15 @@ class StorageHelper(object):
             self._container = self._driver.get_container(container_name=self._base_url)
         else:  # elif self._scheme == 'file':
             # if this is not a known scheme assume local file
-
-            # If the scheme is file, use only the path segment, If not, use the entire URL
-            if self._scheme == 'file':
-                url = parsed.path
-
-            url = url.replace("\\", "/")
-
             # url2pathname is specifically intended to operate on (urlparse result).path
             # and returns a cross-platform compatible result
-            driver_uri = url2pathname(url)
-            path_driver_uri = Path(driver_uri)
-            # if path_driver_uri.is_file():
-            #     driver_uri = str(path_driver_uri.parent)
-            # elif not path_driver_uri.exists():
-            #     # assume a folder and create
-            #     # Path(driver_uri).mkdir(parents=True, exist_ok=True)
-            #     pass
-
-            self._driver = _FileStorageDriver(str(path_driver_uri.root))
-            self._container = None
+            new_url = normalize_local_path(url[len("file://"):] if url.startswith("file://") else url)
+            self._driver = _FileStorageDriver(new_url)
+            # noinspection PyBroadException
+            try:
+                self._container = self._driver.get_container("")
+            except Exception:
+                self._container = None
 
     @classmethod
     def terminate_uploads(cls, force=True, timeout=2.0):
@@ -365,10 +407,11 @@ class StorageHelper(object):
             # since async uploaders are daemon threads, we can just return and let them close by themselves
             return
         # signal all threads to terminate and give them a chance for 'timeout' seconds (total, not per-thread)
-        cls._terminate.set()
+        # cls._terminate.set()
         remaining_timeout = timeout
         for thread in cls._async_upload_threads:
             t = time()
+            # noinspection PyBroadException
             try:
                 thread.join(timeout=remaining_timeout)
             except Exception:
@@ -376,52 +419,136 @@ class StorageHelper(object):
             remaining_timeout -= (time() - t)
 
     @classmethod
+    def get_aws_storage_uri_from_config(cls, bucket_config):
+        uri = (
+            "s3://{}/{}".format(bucket_config.host, bucket_config.bucket)
+            if bucket_config.host
+            else "s3://{}".format(bucket_config.bucket)
+        )
+        if bucket_config.subdir:
+            uri += "/" + bucket_config.subdir
+        return uri
+
+    @classmethod
+    def get_gcp_storage_uri_from_config(cls, bucket_config):
+        return (
+            "gs://{}/{}".format(bucket_config.bucket, bucket_config.subdir)
+            if bucket_config.subdir
+            else "gs://{}".format(bucket_config.bucket)
+        )
+
+    @classmethod
+    def get_azure_storage_uri_from_config(cls, bucket_config):
+        return "azure://{}.blob.core.windows.net/{}".format(bucket_config.account_name, bucket_config.container_name)
+
+    @classmethod
     def get_configuration(cls, bucket_config):
+        return cls.get_aws_configuration(bucket_config)
+
+    @classmethod
+    def get_aws_configuration(cls, bucket_config):
         return cls._s3_configurations.get_config_by_bucket(bucket_config.bucket, bucket_config.host)
 
     @classmethod
+    def get_gcp_configuration(cls, bucket_config):
+        return cls._gs_configurations.get_config_by_uri(
+            cls.get_gcp_storage_uri_from_config(bucket_config),
+            create_if_not_found=False
+        )
+
+    @classmethod
+    def get_azure_configuration(cls, bucket_config):
+        return cls._azure_configurations.get_config(bucket_config.account_name, bucket_config.container_name)
+
+    @classmethod
     def add_configuration(cls, bucket_config, log=None, _test_config=True):
+        return cls.add_aws_configuration(bucket_config, log=log, _test_config=_test_config)
+
+    @classmethod
+    def add_aws_configuration(cls, bucket_config, log=None, _test_config=True):
         # Try to use existing configuration if we have no key and secret
         use_existing = not bucket_config.is_valid()
-
         # Get existing config anyway (we'll either try to use it or alert we're replacing it
-        existing = cls.get_configuration(bucket_config)
-
+        existing = cls.get_aws_configuration(bucket_config)
         configs = cls._s3_configurations
+        uri = cls.get_aws_storage_uri_from_config(bucket_config)
 
         if not use_existing:
             # Test bucket config, fails if unsuccessful
             if _test_config:
-                _Boto3Driver._test_bucket_config(bucket_config, log)
-
+                _Boto3Driver._test_bucket_config(bucket_config, log)  # noqa
             if existing:
                 if log:
-                    log.warning('Overriding existing configuration for %s/%s'
-                                % (existing.host or 'AWS', existing.bucket))
+                    log.warning("Overriding existing configuration for '{}'".format(uri))
                 configs.remove_config(existing)
+            configs.add_config(bucket_config)
         else:
             # Try to use existing configuration
             good_config = False
             if existing:
                 if log:
-                    log.info('Using existing credentials for bucket %s/%s'
-                             % (bucket_config.host or 'AWS', bucket_config.bucket))
-                good_config = _Boto3Driver._test_bucket_config(existing, log, raise_on_error=False)
+                    log.info("Using existing credentials for '{}'".format(uri))
+                good_config = _Boto3Driver._test_bucket_config(existing, log, raise_on_error=False)  # noqa
 
             if not good_config:
                 # Try to use global key/secret
                 configs.update_config_with_defaults(bucket_config)
 
                 if log:
-                    log.info('Using global credentials for bucket %s/%s'
-                             % (bucket_config.host or 'AWS', bucket_config.bucket))
+                    log.info("Using global credentials for '{}'".format(uri))
                 if _test_config:
-                    _Boto3Driver._test_bucket_config(bucket_config, log)
-            else:
-                # do not add anything, existing config is OK
-                return
+                    _Boto3Driver._test_bucket_config(bucket_config, log)  # noqa
+                configs.add_config(bucket_config)
 
-        configs.add_config(bucket_config)
+    @classmethod
+    def add_gcp_configuration(cls, bucket_config, log=None):
+        use_existing = not bucket_config.is_valid()
+        existing = cls.get_gcp_configuration(bucket_config)
+        configs = cls._gs_configurations
+        uri = cls.get_gcp_storage_uri_from_config(bucket_config)
+
+        if not use_existing:
+            if existing:
+                if log:
+                    log.warning("Overriding existing configuration for '{}'".format(uri))
+                configs.remove_config(existing)
+            configs.add_config(bucket_config)
+        else:
+            good_config = False
+            if existing:
+                if log:
+                    log.info("Using existing config for '{}'".format(uri))
+                good_config = _GoogleCloudStorageDriver.test_upload(None, bucket_config)
+            if not good_config:
+                configs.update_config_with_defaults(bucket_config)
+                if log:
+                    log.info("Using global credentials for '{}'".format(uri))
+                configs.add_config(bucket_config)
+
+    @classmethod
+    def add_azure_configuration(cls, bucket_config, log=None):
+        use_existing = not bucket_config.is_valid()
+        existing = cls.get_azure_configuration(bucket_config)
+        configs = cls._azure_configurations
+        uri = cls.get_azure_storage_uri_from_config(bucket_config)
+
+        if not use_existing:
+            if existing:
+                if log:
+                    log.warning("Overriding existing configuration for '{}'".format(uri))
+                configs.remove_config(existing)
+            configs.add_config(bucket_config)
+        else:
+            good_config = False
+            if existing:
+                if log:
+                    log.info("Using existing config for '{}'".format(uri))
+                good_config = _AzureBlobServiceStorageDriver.test_upload(None, bucket_config)
+            if not good_config:
+                configs.update_config_with_defaults(bucket_config)
+                if log:
+                    log.info("Using global credentials for '{}'".format(uri))
+                configs.add_config(bucket_config)
 
     @classmethod
     def add_path_substitution(
@@ -474,6 +601,86 @@ class StorageHelper(object):
         """
         cls._path_substitutions = list()
 
+    def get_object_size_bytes(self, remote_url, silence_errors=False):
+        # type: (str, bool) -> [int, None]
+        """
+        Get size of the remote file in bytes.
+
+        :param str remote_url: The url where the file is stored.
+            E.g. 's3://bucket/some_file.txt', 'file://local/file'
+        :param bool silence_errors: Silence errors that might occur
+            when fetching the size of the file. Default: False
+
+        :return: The size of the file in bytes.
+            None if the file could not be found or an error occurred.
+        """
+        obj = self.get_object(remote_url, silence_errors=silence_errors)
+        return self._get_object_size_bytes(obj, silence_errors)
+
+    def _get_object_size_bytes(self, obj, silence_errors=False):
+        # type: (object) -> [int, None]
+        """
+        Auxiliary function for `get_object_size_bytes`.
+        Get size of the remote object in bytes.
+
+        :param object obj: The remote object
+        :param bool silence_errors: Silence errors that might occur
+            when fetching the size of the file. Default: False
+
+        :return: The size of the object in bytes.
+            None if an error occurred.
+        """
+        if not obj:
+            return None
+        size = None
+        try:
+            if isinstance(self._driver, _HttpDriver) and obj:
+                obj = self._driver._get_download_object(obj)  # noqa
+                size = int(obj.headers.get("Content-Length", 0))
+            elif hasattr(obj, "size"):
+                size = obj.size
+                # Google storage has the option to reload the object to get the size
+                if size is None and hasattr(obj, "reload"):
+                    # noinspection PyBroadException
+                    try:
+                        # To catch google.api_core exceptions
+                        obj.reload()
+                        size = obj.size
+                    except Exception as e:
+                        if not silence_errors:
+                            self.log.warning("Failed obtaining object size on reload: {}('{}')".format(
+                                e.__class__.__name__, str(e)))
+            elif hasattr(obj, "content_length"):
+                # noinspection PyBroadException
+                try:
+                    # To catch botocore exceptions
+                    size = obj.content_length  # noqa
+                except Exception as e:
+                    if not silence_errors:
+                        self.log.warning("Failed obtaining content_length while getting object size: {}('{}')".format(
+                            e.__class__.__name__, str(e)))
+        except Exception as e:
+            if not silence_errors:
+                self.log.warning("Failed getting object size: {}('{}')".format(e.__class__.__name__, str(e)))
+        return size
+
+    def get_object_metadata(self, obj):
+        # type: (object) -> dict
+        """
+        Get the metadata of the remote object.
+        The metadata is a dict containing the following keys: `name`, `size`.
+
+        :param object obj: The remote object
+
+        :return: A dict containing the metadata of the remote object
+        """
+        name_fields = ("name", "url", "key", "blob_name")
+        metadata = {
+            "size": self._get_object_size_bytes(obj),
+            "name": next(filter(None, (getattr(obj, f, None) for f in name_fields)), None),
+        }
+        return metadata
+
     def verify_upload(self, folder_uri='', raise_on_error=True, log_on_error=True):
         """
         Verify that this helper can upload files to a folder.
@@ -514,14 +721,14 @@ class StorageHelper(object):
 
         return folder_uri
 
-    def upload_from_stream(self, stream, dest_path, extra=None, retries=1):
-        dest_path = self._canonize_url(dest_path)
-        object_name = self._normalize_object_name(dest_path)
+    def upload_from_stream(self, stream, dest_path, extra=None, retries=1, return_canonized=True):
+        canonized_dest_path = self._canonize_url(dest_path)
+        object_name = self._normalize_object_name(canonized_dest_path)
         extra = extra.copy() if extra else {}
         extra.update(self._extra)
         last_ex = None
         cb = UploadProgressReport.from_stream(stream, object_name, self._verbose, self._log)
-        for i in range(max(1, retries)):
+        for i in range(max(1, int(retries))):
             try:
                 self._driver.upload_object_via_stream(
                     iterator=stream,
@@ -542,44 +749,69 @@ class StorageHelper(object):
         if last_ex:
             raise last_ex
 
+        result_dest_path = canonized_dest_path if return_canonized else dest_path
+
         if self.scheme in _HttpDriver.schemes:
             # quote link
-            dest_path = quote_url(dest_path)
+            result_dest_path = quote_url(result_dest_path)
 
-        return dest_path
+        return result_dest_path
 
-    def upload(self, src_path, dest_path=None, extra=None, async_enable=False, cb=None, retries=1):
+    def upload(
+        self, src_path, dest_path=None, extra=None, async_enable=False, cb=None, retries=3, return_canonized=True
+    ):
         if not dest_path:
             dest_path = os.path.basename(src_path)
 
-        dest_path = self._canonize_url(dest_path)
+        canonized_dest_path = self._canonize_url(dest_path)
+        dest_path = dest_path.replace('\\', '/')
+        canonized_dest_path = canonized_dest_path.replace('\\', '/')
+
+        result_path = canonized_dest_path if return_canonized else dest_path
 
         if cb and self.scheme in _HttpDriver.schemes:
             # store original callback
             a_cb = cb
 
             # quote link
-            def callback(a_path):
-                return a_cb(quote_url(a_path) if a_path else a_path)
+            def callback(result):
+                return a_cb(quote_url(result_path) if result else result)
             # replace callback with wrapper
             cb = callback
 
         if async_enable:
-            data = self._UploadData(src_path=src_path, dest_path=dest_path, extra=extra, callback=cb, retries=retries)
+            data = self._UploadData(
+                src_path=src_path,
+                dest_path=dest_path,
+                canonized_dest_path=canonized_dest_path,
+                extra=extra,
+                callback=cb,
+                retries=retries,
+                return_canonized=return_canonized
+            )
             StorageHelper._initialize_upload_pool()
             return StorageHelper._upload_pool.apply_async(self._do_async_upload, args=(data,))
         else:
-            res = self._do_upload(src_path, dest_path, extra, cb, verbose=False, retries=retries)
+            res = self._do_upload(
+                    src_path=src_path,
+                    dest_path=dest_path,
+                    canonized_dest_path=canonized_dest_path,
+                    extra=extra,
+                    cb=cb,
+                    verbose=False,
+                    retries=retries,
+                    return_canonized=return_canonized)
             if res:
-                res = quote_url(res)
-            return res
+                result_path = quote_url(result_path)
+            return result_path
 
-    def list(self, prefix=None):
+    def list(self, prefix=None, with_metadata=False):
         """
         List entries in the helper base path.
 
-        Return a list of names inside this helper base path. The base path is
-        determined at creation time and is specific for each storage medium.
+        Return a list of names inside this helper base path or a list of dictionaries containing
+        the objects' metadata. The base path is determined at creation time and is specific
+        for each storage medium.
         For Google Storage and S3 it is the bucket of the path.
         For local files it is the root directory.
 
@@ -589,29 +821,54 @@ class StorageHelper(object):
             must be a string - the path of a sub directory under the base path.
             the returned list will include only objects under that subdir.
 
-        :return: The paths of all the objects in the storage base
-            path under prefix. Listed relative to the base path.
+        :param with_metadata: Instead of returning just the names of the objects, return a list of dictionaries
+            containing the name and metadata of the remote file. Thus, each dictionary will contain the following
+            keys: `name`, `size`.
 
+        :return: The paths of all the objects in the storage base path under prefix or
+            a list of dictionaries containing the objects' metadata.
+            Listed relative to the base path.
         """
-
         if prefix:
+            prefix = self._canonize_url(prefix)
             if prefix.startswith(self._base_url):
-                prefix = prefix[len(self.base_url):].lstrip("/")
-
-            try:
-                res = self._driver.list_container_objects(self._container, ex_prefix=prefix)
-            except TypeError:
-                res = self._driver.list_container_objects(self._container)
-
-            return [
-                obj.name
-                for obj in res if
-                obj.name.startswith(prefix) and obj.name != prefix
+                prefix = prefix[len(self._base_url):]
+                if self._base_url != "file://":
+                    prefix = prefix.lstrip("/")
+            if self._base_url == "file://":
+                prefix = prefix.rstrip("/")
+                if prefix.startswith(str(self._driver.base_path)):
+                    prefix = prefix[len(str(self._driver.base_path)):]
+            res = self._driver.list_container_objects(self._container, ex_prefix=prefix)
+            result = [
+                obj.name if not with_metadata else self.get_object_metadata(obj)
+                for obj in res
             ]
-        else:
-            return [obj.name for obj in self._driver.list_container_objects(self._container)]
 
-    def download_to_file(self, remote_path, local_path, overwrite_existing=False, delete_on_failure=True, verbose=None):
+            if self._base_url == "file://":
+                if not with_metadata:
+                    result = [Path(f).as_posix() for f in result]
+                else:
+                    for metadata_entry in result:
+                        metadata_entry["name"] = Path(metadata_entry["name"]).as_posix()
+            return result
+        else:
+            return [
+                obj.name if not with_metadata else self.get_object_metadata(obj)
+                for obj in self._driver.list_container_objects(self._container)
+            ]
+
+    def download_to_file(
+            self,
+            remote_path,
+            local_path,
+            overwrite_existing=False,
+            delete_on_failure=True,
+            verbose=None,
+            skip_zero_size_check=False,
+            silence_errors=False,
+            direct_access=True
+    ):
         def next_chunk(astream):
             if isinstance(astream, binary_type):
                 chunk = astream
@@ -628,9 +885,17 @@ class StorageHelper(object):
         remote_path = self._canonize_url(remote_path)
         verbose = self._verbose if verbose is None else verbose
 
+        tmp_remote_path = remote_path
+        # noinspection PyBroadException
+        try:
+            tmp_remote_path = normalize_local_path(tmp_remote_path)
+            if tmp_remote_path.exists():
+                remote_path = "file://{}".format(str(tmp_remote_path))
+        except Exception:
+            pass
         # Check if driver type supports direct access:
-        direct_access_path = self._driver.get_direct_access(remote_path)
-        if direct_access_path:
+        direct_access_path = self.get_driver_direct_access(remote_path)
+        if direct_access_path and direct_access:
             return direct_access_path
 
         temp_local_path = None
@@ -638,7 +903,7 @@ class StorageHelper(object):
             if verbose:
                 self._log.info('Start downloading from %s' % remote_path)
             if not overwrite_existing and Path(local_path).is_file():
-                self._log.warning(
+                self._log.debug(
                     'File {} already exists, no need to download, thread id = {}'.format(
                         local_path,
                         threading.current_thread().ident,
@@ -646,10 +911,16 @@ class StorageHelper(object):
                 )
 
                 return local_path
+            if remote_path.startswith("file://"):
+                Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+                # use remote_path, because direct_access_path might be None, because of access_rules
+                # len("file://") == 7
+                shutil.copyfile(remote_path[7:], local_path)
+                return local_path
             # we download into temp_local_path so that if we accidentally stop in the middle,
             # we won't think we have the entire file
             temp_local_path = '{}_{}{}'.format(local_path, time(), self._temp_download_suffix)
-            obj = self._get_object(remote_path)
+            obj = self.get_object(remote_path, silence_errors=silence_errors)
             if not obj:
                 return None
 
@@ -664,29 +935,14 @@ class StorageHelper(object):
             # noinspection PyBroadException
             Path(temp_local_path).parent.mkdir(parents=True, exist_ok=True)
 
-            # try to get file size
-            try:
-                if isinstance(self._driver, _HttpDriver) and obj:
-                    obj = self._driver._get_download_object(obj)
-                    total_size_mb = float(obj.headers.get('Content-Length', 0)) / (1024 * 1024)
-                elif hasattr(obj, 'size'):
-                    size = obj.size
-                    # Google storage has the option to reload the object to get the size
-                    if size is None and hasattr(obj, 'reload'):
-                        obj.reload()
-                        size = obj.size
-
-                    total_size_mb = 0 if size is None else float(size) / (1024 * 1024)
-                elif hasattr(obj, 'content_length'):
-                    total_size_mb = float(obj.content_length) / (1024 * 1024)
-            except (ValueError, AttributeError, KeyError):
-                pass
+            total_size_bytes = self.get_object_size_bytes(remote_path, silence_errors=silence_errors)
+            if total_size_bytes is not None:
+                total_size_mb = float(total_size_bytes) / (1024 * 1024)
 
             # if driver supports download with callback, use it (it might be faster)
             if hasattr(self._driver, 'download_object'):
                 # callback
-                cb = DownloadProgressReport(total_size_mb, verbose,
-                                            remote_path, self._log, chunk_size_mb)
+                cb = DownloadProgressReport(total_size_mb, verbose, remote_path, self._log)
                 self._driver.download_object(obj, temp_local_path, callback=cb)
                 download_reported = bool(cb.last_reported)
                 dl_total_mb = cb.current_status_mb
@@ -700,19 +956,33 @@ class StorageHelper(object):
                         fd.write(data)
                         data, stream = next_chunk(stream)
 
-            if Path(temp_local_path).stat().st_size <= 0:
+            if not skip_zero_size_check and Path(temp_local_path).stat().st_size <= 0:
                 raise Exception('downloaded a 0-sized file')
 
-            # if we are on windows, we need to remove the target file before renaming
+            # if we are on Windows, we need to remove the target file before renaming
             # otherwise posix rename will overwrite the target
             if os.name != 'posix':
+                # noinspection PyBroadException
                 try:
                     os.remove(local_path)
                 except Exception:
                     pass
 
             # rename temp file to local_file
-            os.rename(temp_local_path, local_path)
+            # noinspection PyBroadException
+            try:
+                os.rename(temp_local_path, local_path)
+            except Exception:
+                # noinspection PyBroadException
+                try:
+                    os.unlink(temp_local_path)
+                except Exception:
+                    pass
+                # file was downloaded by a parallel process, check we have the final output and delete the partial copy
+                path_local_path = Path(local_path)
+                if not path_local_path.is_file() or (not skip_zero_size_check and path_local_path.stat().st_size <= 0):
+                    raise Exception('Failed renaming partial file, downloaded file exists and a 0-sized file')
+
             # report download if we are on the second chunk
             if verbose or download_reported:
                 self._log.info(
@@ -725,8 +995,7 @@ class StorageHelper(object):
             if delete_on_failure:
                 # noinspection PyBroadException
                 try:
-                    if temp_local_path:
-                        os.remove(temp_local_path)
+                    os.remove(temp_local_path)
                 except Exception:
                     pass
             return None
@@ -734,7 +1003,7 @@ class StorageHelper(object):
     def download_as_stream(self, remote_path, chunk_size=None):
         remote_path = self._canonize_url(remote_path)
         try:
-            obj = self._get_object(remote_path)
+            obj = self.get_object(remote_path)
             return self._driver.download_object_as_stream(
                 obj, chunk_size=chunk_size, verbose=self._verbose, log=self.log
             )
@@ -762,36 +1031,54 @@ class StorageHelper(object):
             self._log.error("Could not download file : %s, err:%s " % (remote_path, str(e)))
 
     def delete(self, path):
-        return self._driver.delete_object(self._get_object(path))
+        path = self._canonize_url(path)
+        return self._driver.delete_object(self.get_object(path))
 
     def check_write_permissions(self, dest_path=None):
         # create a temporary file, then delete it
         base_url = dest_path or self._base_url
-        dest_path = base_url + '/.clearml.test'
+        dest_path = base_url + "/.clearml.{}.test".format(str(uuid.uuid4()))
         # do not check http/s connection permissions
-        if dest_path.startswith('http'):
+        if dest_path.startswith("http"):
             return True
+
         try:
-            self.upload_from_stream(stream=six.BytesIO(b'clearml'), dest_path=dest_path)
+            self.upload_from_stream(stream=six.BytesIO(b"clearml"), dest_path=dest_path)
+        except Exception:
+            raise ValueError("Insufficient permissions (write failed) for {}".format(base_url))
+        try:
             self.delete(path=dest_path)
         except Exception:
-            raise ValueError('Insufficient permissions for {}'.format(base_url))
+            raise ValueError("Insufficient permissions (delete failed) for {}".format(base_url))
         return True
 
     @classmethod
-    def download_from_url(cls, remote_url, local_path, overwrite_existing=False):
+    def download_from_url(cls, remote_url, local_path, overwrite_existing=False, skip_zero_size_check=False):
         """
         Download a file from remote URL to a local storage
 
         :param remote_url: Remote URL. Example: https://example.com/image.jpg or s3://bucket/folder/file.mp4 etc.
         :param local_path: target location for downloaded file. Example: /tmp/image.jpg
-        :param overwrite_existing: If True and local_path exists, it will overwrite it, otherwise print warning
+        :param overwrite_existing: If True, and local_path exists, it will overwrite it, otherwise print warning
+        :param skip_zero_size_check: If True, no error will be raised for files with zero bytes size.
         :return: local_path if download was successful.
         """
         helper = cls.get(remote_url)
         if not helper:
             return None
-        return helper.download_to_file(remote_url, local_path, overwrite_existing=overwrite_existing)
+        return helper.download_to_file(
+            remote_url, local_path, overwrite_existing=overwrite_existing, skip_zero_size_check=skip_zero_size_check
+        )
+
+    def get_driver_direct_access(self, path):
+        """
+        Check if the helper's driver has a direct access to the file
+
+        :param str path: file path to check access to
+        :return: Return the string representation of the file as path if have access to it, else None
+        """
+
+        return self._driver.get_direct_access(path)
 
     @classmethod
     def _canonize_url(cls, url):
@@ -839,10 +1126,11 @@ class StorageHelper(object):
         elif parsed.scheme == _GoogleCloudStorageDriver.scheme:
             conf = cls._gs_configurations.get_config_by_uri(base_url)
             return str(furl(scheme=parsed.scheme, netloc=conf.bucket))
-        elif parsed.scheme == 'http':
-            return 'http://'
-        elif parsed.scheme == 'https':
-            return 'https://'
+        elif parsed.scheme in _HttpDriver.schemes:
+            for files_server in _Driver.get_file_server_hosts():
+                if base_url.startswith(files_server):
+                    return files_server
+            return parsed.scheme + "://"
         else:  # if parsed.scheme == 'file':
             # if we do not know what it is, we assume file
             return 'file://'
@@ -859,6 +1147,8 @@ class StorageHelper(object):
                 folder_uri = str(Path(folder_uri).absolute())
                 if folder_uri.startswith('/'):
                     folder_uri = _base_url + folder_uri
+                elif platform.system() == "Windows":
+                    folder_uri = ''.join((_base_url, folder_uri))
                 else:
                     folder_uri = '/'.join((_base_url, folder_uri))
 
@@ -888,8 +1178,7 @@ class StorageHelper(object):
 
     def _do_async_upload(self, data):
         assert isinstance(data, self._UploadData)
-        return self._do_upload(data.src_path, data.dest_path, extra=data.extra, cb=data.callback,
-                               verbose=True, retries=data.retries)
+        return self._do_upload(data.src_path, data.dest_path, data.canonized_dest_path, extra=data.extra, cb=data.callback, verbose=True, retries=data.retries, return_canonized=data.return_canonized)
 
     def _upload_from_file(self, local_path, dest_path, extra=None):
         if not hasattr(self._driver, 'upload_object'):
@@ -908,8 +1197,8 @@ class StorageHelper(object):
                 extra=extra)
         return res
 
-    def _do_upload(self, src_path, dest_path, extra=None, cb=None, verbose=False, retries=1):
-        object_name = self._normalize_object_name(dest_path)
+    def _do_upload(self, src_path, dest_path, canonized_dest_path, extra=None, cb=None, verbose=False, retries=1, return_canonized=False):
+        object_name = self._normalize_object_name(canonized_dest_path)
         if cb:
             try:
                 cb(None)
@@ -925,9 +1214,9 @@ class StorageHelper(object):
             else:
                 self._log.info(msg)
         last_ex = None
-        for i in range(max(1, retries)):
+        for i in range(max(1, int(retries))):
             try:
-                if not self._upload_from_file(local_path=src_path, dest_path=dest_path, extra=extra):
+                if not self._upload_from_file(local_path=src_path, dest_path=canonized_dest_path, extra=extra):
                     # retry if failed
                     last_ex = ValueError("Upload failed")
                     continue
@@ -949,13 +1238,25 @@ class StorageHelper(object):
             self._log.debug("Finished upload: %s => %s" % (src_path, object_name))
         if cb:
             try:
-                cb(dest_path)
+                cb(canonized_dest_path if return_canonized else dest_path)
             except Exception as e:
                 self._log.warning("Exception on upload callback: %s" % str(e))
 
-        return dest_path
+        return canonized_dest_path if return_canonized else dest_path
 
-    def _get_object(self, path):
+    def get_object(self, path, silence_errors=False):
+        # type: (str, bool) -> object
+        """
+        Gets the remote object stored at path. The data held by the object
+        differs depending on where it is stored.
+
+        :param str path: the path where the remote object is stored
+        :param bool silence_errors: Silence errors that might occur
+            when fetching the remote object
+
+        :return: The remote object
+        """
+        path = self._canonize_url(path)
         object_name = self._normalize_object_name(path)
         try:
             return self._driver.get_object(
@@ -963,12 +1264,14 @@ class StorageHelper(object):
         except ConnectionError:
             raise DownloadError
         except Exception as e:
-            self.log.warning('Storage helper problem for {}: {}'.format(str(object_name), str(e)))
+            if not silence_errors:
+                self.log.warning("Storage helper problem for {}: {}".format(str(object_name), str(e)))
             return None
 
     @staticmethod
     def _initialize_upload_pool():
-        if not StorageHelper._upload_pool:
+        if not StorageHelper._upload_pool or StorageHelper._upload_pool_pid != os.getpid():
+            StorageHelper._upload_pool_pid = os.getpid()
             StorageHelper._upload_pool = ThreadPool(processes=1)
 
     @staticmethod
@@ -983,41 +1286,69 @@ class StorageHelper(object):
             except Exception:
                 pass
 
+    def exists_file(self, remote_url):
+        remote_url = self._canonize_url(remote_url)
+        object_name = self._normalize_object_name(remote_url)
+        return self._driver.exists_file(
+            container_name=self._container.name if self._container else "", object_name=object_name
+        )
+
 
 class _HttpDriver(_Driver):
     """ LibCloud http/https adapter (simple, enough for now) """
 
-    timeout = (5.0, 30.)
+    timeout_connection = deferred_config('http.timeout.connection', 30)
+    timeout_total = deferred_config('http.timeout.total', 30)
+    max_retries = deferred_config('http.download.max_retries', 15)
     min_kbps_speed = 50
 
     schemes = ('http', 'https')
 
     class _Container(object):
         _default_backend_session = None
-        _default_files_server_host = None
 
         def __init__(self, name, retries=5, **kwargs):
             self.name = name
-            self.session = get_http_session_with_retry(total=retries, connect=retries, read=retries, redirect=retries)
+            self.session = get_http_session_with_retry(
+                total=retries,
+                connect=retries,
+                read=retries,
+                redirect=retries,
+                backoff_factor=0.5,
+                backoff_max=120,
+                status_forcelist=[
+                    requests_codes.request_timeout,
+                    requests_codes.timeout,
+                    requests_codes.bad_gateway,
+                    requests_codes.service_unavailable,
+                    requests_codes.bandwidth_limit_exceeded,
+                    requests_codes.too_many_requests,
+                ],
+                config=config
+            )
+            self._file_server_hosts = set(_HttpDriver.get_file_server_hosts())
 
-        def get_headers(self, url):
+        def _should_attach_auth_header(self):
+            return any(
+                (self.name.rstrip('/') == host.rstrip('/') or self.name.startswith(host.rstrip('/') + '/'))
+                for host in self._file_server_hosts
+            )
+
+        def get_headers(self, _):
             if not self._default_backend_session:
                 from ..backend_interface.base import InterfaceBase
                 self._default_backend_session = InterfaceBase._get_default_session()
-            if self._default_files_server_host is None:
-                self._default_files_server_host = self._default_backend_session.get_files_server_host().rstrip('/')
 
-            if url == self._default_files_server_host or url.startswith(self._default_files_server_host + '/'):
+            if self._should_attach_auth_header():
                 return self._default_backend_session.add_auth_headers({})
-            return None
 
     class _HttpSessionHandle(object):
         def __init__(self, url, is_stream, container_name, object_name):
             self.url, self.is_stream, self.container_name, self.object_name = \
                 url, is_stream, container_name, object_name
 
-    def __init__(self, retries=5):
-        self._retries = retries
+    def __init__(self, retries=None):
+        self._retries = retries or int(self.max_retries)
         self._containers = {}
 
     def get_container(self, container_name, config=None, **kwargs):
@@ -1026,12 +1357,23 @@ class _HttpDriver(_Driver):
         return self._containers[container_name]
 
     def upload_object_via_stream(self, iterator, container, object_name, extra=None, callback=None, **kwargs):
-        url = object_name[:object_name.index('/')]
-        url_path = object_name[len(url) + 1:]
-        full_url = container.name + url
         # when sending data in post, there is no connection timeout, just an entire upload timeout
-        timeout = self.timeout[-1]
-        stream_size = 0
+        timeout = int(self.timeout_total)
+        url = container.name
+        path = object_name
+        if not urlparse(url).netloc:
+            host, _, path = object_name.partition('/')
+            url += host + '/'
+
+        m = MultipartEncoder(fields={
+            path: (path, iterator, get_file_mimetype(object_name))
+        })
+
+        headers = {
+            'Content-Type': m.content_type,
+        }
+        headers.update(container.get_headers(url) or {})
+
         if hasattr(iterator, 'tell') and hasattr(iterator, 'seek'):
             pos = iterator.tell()
             iterator.seek(0, 2)
@@ -1039,8 +1381,9 @@ class _HttpDriver(_Driver):
             iterator.seek(pos, 0)
             timeout = max(timeout, (stream_size / 1024) / float(self.min_kbps_speed))
 
-        res = container.session.post(full_url, files={url_path: iterator}, timeout=timeout,
-                                     headers=container.get_headers(full_url))
+        res = container.session.post(
+            url, data=m, timeout=timeout, headers=headers
+        )
         if res.status_code != requests.codes.ok:
             raise ValueError('Failed uploading object %s (%d): %s' % (object_name, res.status_code, res.text))
 
@@ -1061,14 +1404,17 @@ class _HttpDriver(_Driver):
         container = self._containers[obj.container_name]
         res = container.session.delete(obj.url, headers=container.get_headers(obj.url))
         if res.status_code != requests.codes.ok:
-            self._get_logger().warning('Failed deleting object %s (%d): %s' % (
+            self.get_logger().warning('Failed deleting object %s (%d): %s' % (
                 obj.object_name, res.status_code, res.text))
             return False
         return True
 
     def get_object(self, container_name, object_name, *args, **kwargs):
         is_stream = kwargs.get('stream', True)
-        url = ''.join((container_name, object_name.lstrip('/')))
+        url = '/'.join((
+            container_name[:-1] if container_name.endswith('/') else container_name,
+            object_name.lstrip('/')
+        ))
         return self._HttpSessionHandle(url, is_stream, container_name, object_name)
 
     def _get_download_object(self, obj):
@@ -1079,9 +1425,11 @@ class _HttpDriver(_Driver):
         container = self._containers[obj.container_name]
         # set stream flag before we send the request
         container.session.stream = obj.is_stream
-        res = container.session.get(obj.url, timeout=self.timeout, headers=container.get_headers(obj.url))
+        res = container.session.get(
+            obj.url, timeout=(int(self.timeout_connection), int(self.timeout_total)),
+            headers=container.get_headers(obj.url))
         if res.status_code != requests.codes.ok:
-            raise ValueError('Failed getting object %s (%d): %s' % (obj.object_name, res.status_code, res.text))
+            raise ValueError('Failed getting object %s (%d): %s' % (obj.object_name, res.status_code, res.reason))
         return res
 
     def download_object_as_stream(self, obj, chunk_size=64 * 1024, **_):
@@ -1119,6 +1467,15 @@ class _HttpDriver(_Driver):
         with open(file_path, 'rb') as stream:
             return self.upload_object_via_stream(iterator=stream, container=container,
                                                  object_name=object_name, extra=extra,  callback=callback, **kwargs)
+
+    def exists_file(self, container_name, object_name):
+        # noinspection PyBroadException
+        try:
+            container = self.get_container(container_name)
+            url = container_name + object_name
+            return container.session.head(url, allow_redirects=True, headers=container.get_headers(url)).ok
+        except Exception:
+            return False
 
 
 class _Stream(object):
@@ -1158,6 +1515,9 @@ class _Stream(object):
             if self._input_iterator:
                 try:
                     chunck = next(self._input_iterator)
+                    # make sure we always return bytes
+                    if isinstance(chunck, six.string_types):
+                        chunck = chunck.encode("utf-8")
                     return chunck
                 except StopIteration:
                     self.closed = True
@@ -1220,9 +1580,13 @@ class _Boto3Driver(_Driver):
     _min_pool_connections = 512
     _max_multipart_concurrency = deferred_config('aws.boto3.max_multipart_concurrency', 16)
     _pool_connections = deferred_config('aws.boto3.pool_connections', 512)
+    _connect_timeout = deferred_config('aws.boto3.connect_timeout', 60)
+    _read_timeout = deferred_config('aws.boto3.read_timeout', 60)
+    _signature_version = deferred_config('aws.boto3.signature_version', None)
 
-    _stream_download_pool_connections = 128
+    _stream_download_pool_connections = deferred_config('aws.boto3.stream_connections', 128)
     _stream_download_pool = None
+    _stream_download_pool_pid = None
 
     _containers = {}
 
@@ -1232,7 +1596,7 @@ class _Boto3Driver(_Driver):
     _bucket_location_failure_reported = set()
 
     class _Container(object):
-        _creation_lock = threading.Lock()
+        _creation_lock = ForkSafeRLock()
 
         def __init__(self, name, cfg):
             try:
@@ -1255,18 +1619,24 @@ class _Boto3Driver(_Driver):
                     "endpoint_url": endpoint,
                     "use_ssl": cfg.secure,
                     "verify": cfg.verify,
+                    "region_name": cfg.region or None,  # None in case cfg.region is an empty string
                     "config": botocore.client.Config(
                         max_pool_connections=max(
-                            _Boto3Driver._min_pool_connections,
-                            _Boto3Driver._pool_connections)
+                            int(_Boto3Driver._min_pool_connections),
+                            int(_Boto3Driver._pool_connections)),
+                        connect_timeout=int(_Boto3Driver._connect_timeout),
+                        read_timeout=int(_Boto3Driver._read_timeout),
+                        signature_version=_Boto3Driver._signature_version,
                     )
                 }
                 if not cfg.use_credentials_chain:
                     boto_kwargs["aws_access_key_id"] = cfg.key
                     boto_kwargs["aws_secret_access_key"] = cfg.secret
+                    if cfg.token:
+                        boto_kwargs["aws_session_token"] = cfg.token
 
                 self.resource = boto3.resource(
-                    's3',
+                    "s3",
                     **boto_kwargs
                 )
 
@@ -1277,13 +1647,15 @@ class _Boto3Driver(_Driver):
     @attrs
     class ListResult(object):
         name = attrib(default=None)
+        size = attrib(default=None)
 
     def __init__(self):
         pass
 
     def _get_stream_download_pool(self):
-        if self._stream_download_pool is None:
-            self._stream_download_pool = ThreadPoolExecutor(max_workers=self._stream_download_pool_connections)
+        if self._stream_download_pool is None or self._stream_download_pool_pid != os.getpid():
+            self._stream_download_pool_pid = os.getpid()
+            self._stream_download_pool = ThreadPoolExecutor(max_workers=int(self._stream_download_pool_connections))
         return self._stream_download_pool
 
     def get_container(self, container_name, config=None, **kwargs):
@@ -1295,13 +1667,36 @@ class _Boto3Driver(_Driver):
     def upload_object_via_stream(self, iterator, container, object_name, callback=None, extra=None, **kwargs):
         import boto3.s3.transfer
         stream = _Stream(iterator)
+        extra_args = {}
         try:
+            extra_args = {
+                'ContentType': get_file_mimetype(object_name)
+            }
+            extra_args.update(container.config.extra_args or {})
             container.bucket.upload_fileobj(stream, object_name, Config=boto3.s3.transfer.TransferConfig(
                 use_threads=container.config.multipart,
                 max_concurrency=self._max_multipart_concurrency if container.config.multipart else 1,
                 num_download_attempts=container.config.retries),
                 Callback=callback,
+                ExtraArgs=extra_args,
             )
+        except RuntimeError:
+            # one might get an error similar to: "RuntimeError: cannot schedule new futures after interpreter shutdown"
+            # In this case, retry the upload without threads
+            try:
+                container.bucket.upload_fileobj(
+                    stream,
+                    object_name,
+                    Config=boto3.s3.transfer.TransferConfig(
+                        use_threads=False,
+                        num_download_attempts=container.config.retries,
+                    ),
+                    Callback=callback,
+                    ExtraArgs=extra_args
+                )
+            except Exception as ex:
+                self.get_logger().error("Failed uploading: %s" % ex)
+                return False
         except Exception as ex:
             self.get_logger().error('Failed uploading: %s' % ex)
             return False
@@ -1309,14 +1704,37 @@ class _Boto3Driver(_Driver):
 
     def upload_object(self, file_path, container, object_name, callback=None, extra=None, **kwargs):
         import boto3.s3.transfer
+        extra_args = {}
         try:
+            extra_args = {
+                'ContentType': get_file_mimetype(object_name or file_path)
+            }
+            extra_args.update(container.config.extra_args or {})
             container.bucket.upload_file(file_path, object_name, Config=boto3.s3.transfer.TransferConfig(
                 use_threads=container.config.multipart,
                 max_concurrency=self._max_multipart_concurrency if container.config.multipart else 1,
                 num_download_attempts=container.config.retries),
-                Callback=callback)
+                Callback=callback,
+                ExtraArgs=extra_args,
+            )
+        except RuntimeError:
+            # one might get an error similar to: "RuntimeError: cannot schedule new futures after interpreter shutdown"
+            # In this case, retry the upload without threads
+            try:
+                container.bucket.upload_file(
+                    file_path,
+                    object_name,
+                    Config=boto3.s3.transfer.TransferConfig(
+                        use_threads=False, num_download_attempts=container.config.retries
+                    ),
+                    Callback=callback,
+                    ExtraArgs=extra_args
+                )
+            except Exception as ex:
+                self.get_logger().error("Failed uploading: %s" % ex)
+                return False
         except Exception as ex:
-            self.get_logger().error('Failed uploading: %s' % ex)
+            self.get_logger().error("Failed uploading: %s" % ex)
             return False
         return True
 
@@ -1326,7 +1744,7 @@ class _Boto3Driver(_Driver):
         else:
             res = container.bucket.objects.all()
         for res in res:
-            yield self.ListResult(name=res.key)
+            yield self.ListResult(name=res.key, size=res.size)
 
     def delete_object(self, object, **kwargs):
         from botocore.exceptions import ClientError
@@ -1375,12 +1793,12 @@ class _Boto3Driver(_Driver):
             self.get_logger().warning('failed saving after download: overwrite=False and file exists (%s)' % str(p))
             return
         container = self._containers[obj.container_name]
-        obj.download_file(str(p),
-                          Callback=callback,
-                          Config=boto3.s3.transfer.TransferConfig(
-                              use_threads=container.config.multipart,
-                              max_concurrency=self._max_multipart_concurrency if container.config.multipart else 1,
-                              num_download_attempts=container.config.retries))
+        Config = boto3.s3.transfer.TransferConfig(
+            use_threads=container.config.multipart,
+            max_concurrency=self._max_multipart_concurrency if container.config.multipart else 1,
+            num_download_attempts=container.config.retries
+        )
+        obj.download_file(str(p), Callback=callback, Config=Config)
 
     @classmethod
     def _test_bucket_config(cls, conf, log, test_path='', raise_on_error=True, log_on_error=True):
@@ -1399,6 +1817,8 @@ class _Boto3Driver(_Driver):
             fullname = furl(conf.bucket).add(path=test_path).add(path='%s-upload_test' % cls.__module__)
             bucket_name = str(fullname.path.segments[0])
             filename = str(furl(path=fullname.path.segments[1:]))
+            if conf.subdir:
+                filename = "{}/{}".format(conf.subdir, filename)
 
             data = {
                 'user': getpass.getuser(),
@@ -1406,13 +1826,13 @@ class _Boto3Driver(_Driver):
                 'time': datetime.utcnow().isoformat()
             }
 
-            boto_session = boto3.Session(conf.key, conf.secret)
-            boto_resource = boto_session.resource('s3', conf.region)
+            boto_session = boto3.Session(conf.key, conf.secret, aws_session_token=conf.token)
+            endpoint = (('https://' if conf.secure else 'http://') + conf.host) if conf.host else None
+            boto_resource = boto_session.resource('s3', region_name=conf.region or None, endpoint_url=endpoint)
             bucket = boto_resource.Bucket(bucket_name)
             bucket.put_object(Key=filename, Body=six.b(json.dumps(data)))
 
             region = cls._get_bucket_region(conf=conf, log=log, report_info=True)
-
             if region and ((conf.region and region != conf.region) or (not conf.region and region != 'us-east-1')):
                 msg = "incorrect region specified for bucket %s (detected region %s)" % (conf.bucket, region)
             else:
@@ -1461,7 +1881,7 @@ class _Boto3Driver(_Driver):
                 cls._bucket_location_failure_reported.add(conf.get_bucket_host())
 
         try:
-            boto_session = boto3.Session(conf.key, conf.secret)
+            boto_session = boto3.Session(conf.key, conf.secret, aws_session_token=conf.token)
             boto_resource = boto_session.resource('s3')
             return boto_resource.meta.client.get_bucket_location(Bucket=conf.bucket)["LocationConstraint"]
 
@@ -1482,12 +1902,22 @@ class _Boto3Driver(_Driver):
     def test_upload(self, test_path, config, **_):
         return True
 
+    def exists_file(self, container_name, object_name):
+        obj = self.get_object(container_name, object_name)
+        # noinspection PyBroadException
+        try:
+            obj.load()
+        except Exception:
+            return False
+        return bool(obj)
+
 
 class _GoogleCloudStorageDriver(_Driver):
     """Storage driver for google cloud storage"""
 
-    _stream_download_pool_connections = 128
+    _stream_download_pool_connections = deferred_config('google.storage.stream_connections', 128)
     _stream_download_pool = None
+    _stream_download_pool_pid = None
 
     _containers = {}
 
@@ -1508,17 +1938,27 @@ class _GoogleCloudStorageDriver(_Driver):
             self.name = name[len(_GoogleCloudStorageDriver.scheme_prefix):]
 
             if cfg.credentials_json:
-                credentials = service_account.Credentials.from_service_account_file(cfg.credentials_json)
+                try:
+                    credentials = service_account.Credentials.from_service_account_file(cfg.credentials_json)
+                except ValueError:
+                    credentials = None
             else:
                 credentials = None
 
             self.client = storage.Client(project=cfg.project, credentials=credentials)
+            for adapter in self.client._http.adapters.values():
+                if cfg.pool_connections:
+                    adapter._pool_connections = cfg.pool_connections
+                if cfg.pool_maxsize:
+                    adapter._pool_maxsize = cfg.pool_maxsize
+
             self.config = cfg
             self.bucket = self.client.bucket(self.name)
 
     def _get_stream_download_pool(self):
-        if self._stream_download_pool is None:
-            self._stream_download_pool = ThreadPoolExecutor(max_workers=self._stream_download_pool_connections)
+        if self._stream_download_pool is None or self._stream_download_pool_pid != os.getpid():
+            self._stream_download_pool_pid = os.getpid()
+            self._stream_download_pool = ThreadPoolExecutor(max_workers=int(self._stream_download_pool_connections))
         return self._stream_download_pool
 
     def get_container(self, container_name, config=None, **kwargs):
@@ -1545,8 +1985,13 @@ class _GoogleCloudStorageDriver(_Driver):
             return False
         return True
 
-    def list_container_objects(self, container, **kwargs):
-        return list(container.bucket.list_blobs())
+    def list_container_objects(self, container, ex_prefix=None, **kwargs):
+        # noinspection PyBroadException
+        try:
+            return list(container.bucket.list_blobs(prefix=ex_prefix))
+        except TypeError:
+            # google-cloud-storage < 1.17
+            return [blob for blob in container.bucket.list_blobs() if blob.name.startswith(ex_prefix)]
 
     def delete_object(self, object, **kwargs):
         try:
@@ -1616,29 +2061,168 @@ class _GoogleCloudStorageDriver(_Driver):
     def get_direct_access(self, remote_path, **_):
         return None
 
+    def exists_file(self, container_name, object_name):
+        return self.get_object(container_name, object_name).exists()
+
 
 class _AzureBlobServiceStorageDriver(_Driver):
-    scheme = 'azure'
+    scheme = "azure"
 
     _containers = {}
+    _max_connections = deferred_config("azure.storage.max_connections", 0)
 
     class _Container(object):
-        def __init__(self, name, config):
-            try:
-                from azure.common import AzureHttpError  # noqa: F401
-                from azure.storage.blob import BlockBlobService
-            except ImportError:
-                raise UsageError(
-                    'Azure blob storage driver not found. '
-                    'Please install driver using: pip install \"azure.storage.blob<=2.1.0\"'
-                )
-
+        def __init__(self, name, config, account_url):
+            self.MAX_SINGLE_PUT_SIZE = 4 * 1024 * 1024
+            self.SOCKET_TIMEOUT = (300, 2000)
             self.name = name
             self.config = config
-            self.blob_service = BlockBlobService(
-                account_name=config.account_name,
-                account_key=config.account_key,
-            )
+            self.account_url = account_url
+            try:
+                from azure.storage.blob import BlobServiceClient  # noqa
+
+                self.__legacy = False
+            except ImportError:
+                try:
+                    from azure.storage.blob import BlockBlobService  # noqa
+                    from azure.common import AzureHttpError  # noqa: F401
+
+                    self.__legacy = True
+                except ImportError:
+                    raise UsageError(
+                        "Azure blob storage driver not found. "
+                        "Please install driver using: 'pip install clearml[azure]' or "
+                        "pip install '\"azure.storage.blob>=12.0.0\"'"
+                    )
+
+            if self.__legacy:
+                self.__blob_service = BlockBlobService(
+                    account_name=self.config.account_name,
+                    account_key=self.config.account_key,
+                )
+                self.__blob_service.MAX_SINGLE_PUT_SIZE = self.MAX_SINGLE_PUT_SIZE
+                self.__blob_service.socket_timeout = self.SOCKET_TIMEOUT
+            else:
+                credential = {"account_name": self.config.account_name, "account_key": self.config.account_key}
+                self.__blob_service = BlobServiceClient(
+                    account_url=account_url,
+                    credential=credential,
+                    max_single_put_size=self.MAX_SINGLE_PUT_SIZE,
+                )
+
+        @staticmethod
+        def _get_max_connections_dict(max_connections=None, key="max_connections"):
+            # must cast for deferred resolving
+            try:
+                max_connections = max_connections or int(_AzureBlobServiceStorageDriver._max_connections)
+            except (AttributeError, TypeError):
+                return {}
+            return {key: int(max_connections)} if max_connections else {}
+
+        def create_blob_from_data(
+            self, container_name, object_name, blob_name, data, max_connections=None,
+                progress_callback=None, content_settings=None
+        ):
+            if self.__legacy:
+                self.__blob_service.create_blob_from_bytes(
+                    container_name,
+                    object_name,
+                    data,
+                    progress_callback=progress_callback,
+                    **self._get_max_connections_dict(max_connections)
+                )
+            else:
+                client = self.__blob_service.get_blob_client(container_name, blob_name)
+                client.upload_blob(
+                    data, overwrite=True,
+                    content_settings=content_settings,
+                    **self._get_max_connections_dict(max_connections, key="max_concurrency")
+                )
+
+        def create_blob_from_path(
+            self, container_name, blob_name, path, max_connections=None, content_settings=None, progress_callback=None
+        ):
+            if self.__legacy:
+                self.__blob_service.create_blob_from_path(
+                    container_name,
+                    blob_name,
+                    path,
+                    content_settings=content_settings,
+                    progress_callback=progress_callback,
+                    **self._get_max_connections_dict(max_connections)
+                )
+            else:
+                with open(path, "rb") as f:
+                    self.create_blob_from_data(
+                        container_name, None, blob_name, f,
+                        content_settings=content_settings,
+                        max_connections=max_connections
+                    )
+
+        def delete_blob(self, container_name, blob_name):
+            if self.__legacy:
+                self.__blob_service.delete_blob(
+                    container_name,
+                    blob_name,
+                )
+            else:
+                client = self.__blob_service.get_blob_client(container_name, blob_name)
+                client.delete_blob()
+
+        def exists(self, container_name, blob_name):
+            if self.__legacy:
+                return not self.__blob_service.exists(container_name, blob_name)
+            else:
+                client = self.__blob_service.get_blob_client(container_name, blob_name)
+                return client.exists()
+
+        def list_blobs(self, container_name, prefix=None):
+            if self.__legacy:
+                return self.__blob_service.list_blobs(container_name=container_name, prefix=prefix)
+            else:
+                client = self.__blob_service.get_container_client(container_name)
+                return client.list_blobs(name_starts_with=prefix)
+
+        def get_blob_properties(self, container_name, blob_name):
+            if self.__legacy:
+                return self.__blob_service.get_blob_properties(container_name, blob_name)
+            else:
+                client = self.__blob_service.get_blob_client(container_name, blob_name)
+                return client.get_blob_properties()
+
+        def get_blob_to_bytes(self, container_name, blob_name, progress_callback=None):
+            if self.__legacy:
+                return self.__blob_service.get_blob_to_bytes(
+                    container_name,
+                    blob_name,
+                    progress_callback=progress_callback,
+                )
+            else:
+                client = self.__blob_service.get_blob_client(container_name, blob_name)
+                return client.download_blob().content_as_bytes()
+
+        def get_blob_to_path(self, container_name, blob_name, path, max_connections=None, progress_callback=None):
+            if self.__legacy:
+                return self.__blob_service.get_blob_to_path(
+                    container_name,
+                    blob_name,
+                    path,
+                    progress_callback=progress_callback,
+                    **self._get_max_connections_dict(max_connections)
+                )
+            else:
+                client = self.__blob_service.get_blob_client(container_name, blob_name)
+                with open(path, "wb") as file:
+                    return client.download_blob(
+                        **self._get_max_connections_dict(max_connections, key="max_concurrency")
+                    ).download_to_stream(file)
+
+        def is_legacy(self):
+            return self.__legacy
+
+        @property
+        def blob_service(self):
+            return self.__blob_service
 
     @attrs
     class _Object(object):
@@ -1646,52 +2230,61 @@ class _AzureBlobServiceStorageDriver(_Driver):
         blob_name = attrib()
         content_length = attrib()
 
-    def get_container(self, container_name=None, config=None, **kwargs):
+    def get_container(self, container_name=None, config=None, account_url=None, **kwargs):
         container_name = container_name or config.container_name
         if container_name not in self._containers:
-            self._containers[container_name] = self._Container(name=container_name, config=config)
-        # self._containers[container_name].config.retries = kwargs.get('retries', 5)
+            self._containers[container_name] = self._Container(
+                name=container_name, config=config, account_url=account_url
+            )
         return self._containers[container_name]
 
-    def upload_object_via_stream(self, iterator, container, object_name, callback=None, extra=None, **kwargs):
-        from azure.common import AzureHttpError  # noqa
+    def upload_object_via_stream(
+        self, iterator, container, object_name, callback=None, extra=None, max_connections=None, **kwargs
+    ):
+        try:
+            from azure.common import AzureHttpError  # noqa
+        except ImportError:
+            from azure.core.exceptions import HttpResponseError  # noqa
+
+            AzureHttpError = HttpResponseError  # noqa
 
         blob_name = self._blob_name_from_object_path(object_name, container.name)  # noqa: F841
         try:
-            container.blob_service.MAX_SINGLE_PUT_SIZE = 16 * 1024 * 1024
-            container.blob_service.socket_timeout = (300, 2000)
-            container.blob_service.create_blob_from_bytes(
+            container.create_blob_from_data(
                 container.name,
                 object_name,
+                blob_name,
                 iterator.read() if hasattr(iterator, "read") else bytes(iterator),
-                # timeout=300,
-                max_connections=2,
+                max_connections=max_connections,
                 progress_callback=callback,
             )
             return True
         except AzureHttpError as ex:
-            self.get_logger().error('Failed uploading (Azure error): %s' % ex)
+            self.get_logger().error("Failed uploading (Azure error): %s" % ex)
         except Exception as ex:
-            self.get_logger().error('Failed uploading: %s' % ex)
+            self.get_logger().error("Failed uploading: %s" % ex)
         return False
 
-    def upload_object(self, file_path, container, object_name, callback=None, extra=None, **kwargs):
-        from azure.common import AzureHttpError  # noqa
+    def upload_object(
+        self, file_path, container, object_name, callback=None, extra=None, max_connections=None, **kwargs
+    ):
+        try:
+            from azure.common import AzureHttpError  # noqa
+        except ImportError:
+            from azure.core.exceptions import HttpResponseError  # noqa
+
+            AzureHttpError = HttpResponseError  # noqa
 
         blob_name = self._blob_name_from_object_path(object_name, container.name)
-        stream = None
         try:
             from azure.storage.blob import ContentSettings  # noqa
-            from mimetypes import guess_type
-            container.blob_service.MAX_SINGLE_PUT_SIZE = 16 * 1024 * 1024
-            container.blob_service.socket_timeout = (300, 2000)
-            container.blob_service.create_blob_from_path(
+
+            container.create_blob_from_path(
                 container.name,
                 blob_name,
                 file_path,
-                # timeout=300,
-                max_connections=2,
-                content_settings=ContentSettings(content_type=guess_type(file_path)),
+                max_connections=max_connections,
+                content_settings=ContentSettings(content_type=get_file_mimetype(object_name or file_path)),
                 progress_callback=callback,
             )
             return True
@@ -1699,20 +2292,17 @@ class _AzureBlobServiceStorageDriver(_Driver):
             self.get_logger().error('Failed uploading (Azure error): %s' % ex)
         except Exception as ex:
             self.get_logger().error('Failed uploading: %s' % ex)
-        finally:
-            if stream:
-                stream.close()
 
     def list_container_objects(self, container, ex_prefix=None, **kwargs):
-        return list(container.blob_service.list_blobs(container_name=container.name, prefix=ex_prefix))
+        return list(container.list_blobs(container_name=container.name, prefix=ex_prefix))
 
     def delete_object(self, object, **kwargs):
         container = object.container
-        container.blob_service.delete_blob(
+        container.delete_blob(
             container.name,
             object.blob_name,
         )
-        return not object.container.blob_service.exists(container.name, object.blob_name)
+        return not object.container.exists(container.name, object.blob_name)
 
     def get_object(self, container_name, object_name, *args, **kwargs):
         container = self._containers.get(container_name)
@@ -1720,34 +2310,39 @@ class _AzureBlobServiceStorageDriver(_Driver):
             raise StorageError("Container `{}` not found for object {}".format(container_name, object_name))
 
         # blob_name = self._blob_name_from_object_path(object_name, container_name)
-        blob = container.blob_service.get_blob_properties(container.name, object_name)
+        blob = container.get_blob_properties(container.name, object_name)
 
-        return self._Object(container=container, blob_name=blob.name, content_length=blob.properties.content_length)
+        if container.is_legacy():
+            return self._Object(container=container, blob_name=blob.name, content_length=blob.properties.content_length)
+        else:
+            return self._Object(container=container, blob_name=blob.name, content_length=blob.size)
 
     def download_object_as_stream(self, obj, verbose, *_, **__):
         container = obj.container
         total_size_mb = obj.content_length / (1024. * 1024.)
         remote_path = os.path.join(
-            "{}://".format(self.scheme),
-            container.config.account_name,
-            container.name,
-            obj.blob_name
+            "{}://".format(self.scheme), container.config.account_name, container.name, obj.blob_name
         )
         cb = DownloadProgressReport(total_size_mb, verbose, remote_path, self.get_logger())
-        blob = container.blob_service.get_blob_to_bytes(
+        blob = container.get_blob_to_bytes(
             container.name,
             obj.blob_name,
             progress_callback=cb,
         )
-        return blob.content
+        if container.is_legacy():
+            return blob.content
+        else:
+            return blob
 
-    def download_object(self, obj, local_path, overwrite_existing=True, delete_on_failure=True, callback=None, **_):
+    def download_object(
+        self, obj, local_path, overwrite_existing=True, delete_on_failure=True, callback=None, max_connections=None, **_
+    ):
         p = Path(local_path)
         if not overwrite_existing and p.is_file():
-            self.get_logger().warning('failed saving after download: overwrite=False and file exists (%s)' % str(p))
+            self.get_logger().warning("Failed saving after download: overwrite=False and file exists (%s)" % str(p))
             return
 
-        download_done = threading.Event()
+        download_done = SafeEvent()
         download_done.counter = 0
 
         def callback_func(current, total):
@@ -1760,14 +2355,15 @@ class _AzureBlobServiceStorageDriver(_Driver):
 
         container = obj.container
         container.blob_service.MAX_SINGLE_GET_SIZE = 5 * 1024 * 1024
-        _ = container.blob_service.get_blob_to_path(
+        _ = container.get_blob_to_path(
             container.name,
             obj.blob_name,
             local_path,
-            max_connections=10,
+            max_connections=max_connections,
             progress_callback=callback_func,
         )
-        download_done.wait()
+        if container.is_legacy():
+            download_done.wait()
 
     def test_upload(self, test_path, config, **_):
         container = self.get_container(config=config)
@@ -1821,6 +2417,10 @@ class _AzureBlobServiceStorageDriver(_Driver):
 
     def get_direct_access(self, remote_path, **_):
         return None
+
+    def exists_file(self, container_name, object_name):
+        container = self.get_container(container_name)
+        return container.exists(container_name, blob_name=object_name)
 
 
 class _FileStorageDriver(_Driver):
@@ -1884,8 +2484,6 @@ class _FileStorageDriver(_Driver):
 
         try:
             stat = os.stat(full_path)
-            if not os.path.isdir(full_path):
-                raise OSError("Target path \"{}\" is not a directory".format(full_path))
         except OSError:
             raise OSError("Target path \"{}\" is not accessible or does not exist".format(full_path))
 
@@ -1942,12 +2540,14 @@ class _FileStorageDriver(_Driver):
                 continue
             yield self._make_container(container_name)
 
-    def _get_objects(self, container):
+    def _get_objects(self, container, prefix=None):
         """
         Recursively iterate through the file-system and return the object names
         """
 
         cpath = self.get_container_cdn_url(container, check=True)
+        if prefix:
+            cpath += "/" + prefix
 
         for folder, subfolders, files in os.walk(cpath, topdown=True):
             # Remove unwanted subfolders
@@ -1960,17 +2560,20 @@ class _FileStorageDriver(_Driver):
                 object_name = os.path.relpath(full_path, start=cpath)
                 yield self._make_object(container, object_name)
 
-    def iterate_container_objects(self, container):
+    def iterate_container_objects(self, container, prefix=None):
         """
         Returns a generator of objects for the given container.
 
         :param container: Container instance
         :type container: :class:`Container`
+        :param prefix: The path of a sub directory under the base container path.
+            The iterator will only include paths under that subdir.
+        :type prefix: Optional[str]
 
         :return: A generator of Object instances.
         """
 
-        return self._get_objects(container)
+        return self._get_objects(container, prefix=prefix)
 
     def get_container(self, container_name, **_):
         """
@@ -2015,6 +2618,16 @@ class _FileStorageDriver(_Driver):
         :return: An Object instance.
         """
         container = self._make_container(container_name)
+        if os.path.isfile(os.path.join(container_name, object_name)):
+            return self.Object(
+                name=object_name,
+                container=container,
+                size=Path(object_name).stat().st_size,
+                driver=self,
+                extra=None,
+                hash=None,
+                meta_data=None,
+            )
         return self._make_object(container, object_name)
 
     def get_object_cdn_url(self, obj):
@@ -2113,8 +2726,7 @@ class _FileStorageDriver(_Driver):
         :param extra: (optional) Extra attributes (driver specific).
         :type extra: ``dict``
         """
-
-        path = self.get_container_cdn_url(container, check=True)
+        path = self.get_container_cdn_url(container, check=False)
         obj_path = os.path.join(path, object_name)
         base_path = os.path.dirname(obj_path)
 
@@ -2180,6 +2792,8 @@ class _FileStorageDriver(_Driver):
 
         :return: True on success.
         """
+        if not obj:
+            return False
 
         path = self.get_object_cdn_url(obj)
 
@@ -2259,8 +2873,8 @@ class _FileStorageDriver(_Driver):
 
         return True
 
-    def list_container_objects(self, container, **kwargs):
-        return list(self.iterate_container_objects(container))
+    def list_container_objects(self, container, ex_prefix=None, **kwargs):
+        return list(self.iterate_container_objects(container, prefix=ex_prefix))
 
     @staticmethod
     def _read_in_chunks(iterator, chunk_size=None, fill_size=False, yield_empty=False):
@@ -2336,6 +2950,49 @@ class _FileStorageDriver(_Driver):
     def test_upload(self, test_path, config, **kwargs):
         return True
 
+    def exists_file(self, container_name, object_name):
+        return os.path.isfile(object_name)
+
+
+def normalize_local_path(local_path):
+    """
+    Get a normalized local path
+
+    :param local_path: Path of the local file/dir
+    :type local_path: str
+
+    :return: Normalized local path
+    :rtype: Path
+    """
+    local_path = os.path.normpath(local_path)
+    local_path = os.path.expanduser(local_path)
+    local_path = os.path.expandvars(local_path)
+    local_path = os.path.realpath(local_path)
+    local_path = os.path.abspath(local_path)
+    local_path = Path(local_path)
+    return local_path
+
+
+def get_file_mimetype(file_path):
+    """
+    Get MIME types of a file
+
+    :param file_path: Path of the local file
+    :type file_path: str
+
+    :return: File MIME type. Return None if failed to get it
+    :rtype: str
+    """
+    # noinspection PyBroadException
+    try:
+        file_path = Path(file_path).resolve()
+        mimetype, _ = mimetypes.guess_type(file_path.as_posix())
+        if mimetype:
+            return mimetype
+    except Exception:
+        pass
+    return 'binary/octet-stream'
+
 
 driver_schemes = set(
     filter(
@@ -2348,3 +3005,4 @@ driver_schemes = set(
 )
 
 remote_driver_schemes = driver_schemes - {_FileStorageDriver.scheme}
+cloud_driver_schemes = remote_driver_schemes - set(_HttpDriver.schemes)

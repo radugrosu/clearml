@@ -1,6 +1,7 @@
 """ ClearML configuration wizard"""
 from __future__ import print_function
 
+import six
 import argparse
 import os
 
@@ -15,10 +16,10 @@ from clearml.config import config_obj
 from clearml.utilities.pyhocon import ConfigFactory, ConfigMissingException
 
 description = "\n" \
-    "Please create new clearml credentials through the profile page in " \
-    "your `clearml-server` web app (e.g. http://localhost:8080/profile) \n"\
-    "Or create a free account at https://app.community.clear.ml/profile\n\n" \
-    "In the profile page, press \"Create new credentials\", then press \"Copy to clipboard\".\n" \
+    "Please create new clearml credentials through the settings page in " \
+    "your `clearml-server` web app (e.g. http://localhost:8080//settings/workspace-configuration) \n"\
+    "Or create a free account at https://app.clear.ml/settings/workspace-configuration\n\n" \
+    "In settings page, press \"Create new credentials\", then press \"Copy to clipboard\".\n" \
     "\n" \
     "Paste copied configuration here:\n"
 
@@ -67,13 +68,24 @@ def main():
     print(description, end='')
     sentinel = ''
     parse_input = ''
-    for line in iter(input, sentinel):
-        parse_input += line+'\n'
-        if line.rstrip() == '}':
-            break
+
+    if os.environ.get("JPY_PARENT_PID"):
+        # When running from a colab instance and calling clearml-init
+        # colab will squish the api credentials into a single line
+        # The regex splits this single line based on 2 spaces or more
+        import re
+        api_input = input()
+        parse_input = '\n'.join(re.split(r" {2,}", api_input))
+    else:
+        for line in iter(input, sentinel):
+            parse_input += line+'\n'
+            if line.rstrip() == '}':
+                break
+
     credentials = None
     api_server = None
     web_server = None
+    files_server = None
     # noinspection PyBroadException
     try:
         parsed = ConfigFactory.parse_string(parse_input)
@@ -81,11 +93,13 @@ def main():
             # Take the credentials in raw form or from api section
             credentials = get_parsed_field(parsed, ["credentials"])
             api_server = get_parsed_field(parsed, ["api_server", "host"])
-            web_server = get_parsed_field(parsed, ["web_server"])
+            web_server = get_parsed_field(parsed, ["web_server"])  # TODO: if previous fails, this will fail too
+            files_server = get_parsed_field(parsed, ["files_server"])
     except Exception:
         credentials = credentials or None
         api_server = api_server or None
         web_server = web_server or None
+        files_server = files_server or None
 
     while not credentials or set(credentials) != {"access_key", "secret_key"}:
         print('Could not parse credentials, please try entering them manually.')
@@ -95,27 +109,53 @@ def main():
                                                                  credentials['secret_key'][0:4] + "***"))
     web_input = True
     if web_server:
-        host = input_url('WEB Host', web_server)
+        host = web_server
     elif api_server:
         web_input = False
-        host = input_url('API Host', api_server)
+        host = api_server
     else:
         print(host_description.format(CONFIG_FILE=args.file, HOST=def_host,))
         host = input_url('WEB Host', '')
 
     parsed_host = verify_url(host)
-    api_host, files_host, web_host = parse_host(parsed_host, allow_input=True)
+    api_host, files_host, web_host = parse_known_host(parsed_host)
 
-    # on of these two we configured
+    hosts_dict = {
+        "API": api_server,
+        "Files": files_server,
+        "Web": web_server
+    }
+
+    infered_hosts_dict = {
+        "API": api_host,
+        "Files": files_host,
+        "Web": web_host
+    }
+
+    for host_type, url in six.iteritems(hosts_dict):
+        if url is None or not (
+            url.startswith('http://') or url.startswith('https://')
+        ):
+            infered_host_url = infered_hosts_dict[host_type]
+            if infered_host_url != "":
+                hosts_dict[host_type] = infered_host_url
+            else:
+                hosts_dict[host_type] = input_url(host_type)
+
+    api_host, files_host, web_host = hosts_dict['API'], hosts_dict['Files'], hosts_dict['Web']
+
+    # one of these two we configured
     if not web_input:
         web_host = input_url('Web Application Host', web_host)
     else:
-        api_host = input_url('API Host', api_host)
-
-    files_host = input_url('File Store Host', files_host)
+        if web_input is True and not web_host:
+            web_host = host
 
     print('\nClearML Hosts configuration:\nWeb App: {}\nAPI: {}\nFile Store: {}\n'.format(
         web_host, api_host, files_host))
+
+    if len(set([web_host, api_host, files_host])) != 3:
+        raise ValueError("All three server URLs should be distinct")
 
     retry = 1
     max_retries = 2
@@ -146,7 +186,7 @@ def main():
                      '    api_server: %s\n' \
                      '    web_server: %s\n' \
                      '    files_server: %s\n' \
-                     '    # Credentials are generated using the webapp, %s/profile\n' \
+                     '    # Credentials are generated using the webapp, %s/settings\n' \
                      '    # Override with os environment: CLEARML_API_ACCESS_KEY / CLEARML_API_SECRET_KEY\n' \
                      '    credentials {"access_key": "%s", "secret_key": "%s"}\n' \
                      '}\n' \
@@ -162,7 +202,7 @@ def main():
     print('ClearML setup completed successfully.')
 
 
-def parse_host(parsed_host, allow_input=True):
+def parse_known_host(parsed_host):
     if parsed_host.netloc.startswith('demoapp.'):
         # this is our demo server
         api_host = parsed_host.scheme + "://" + parsed_host.netloc.replace('demoapp.', 'demoapi.', 1) + parsed_host.path
@@ -188,33 +228,20 @@ def parse_host(parsed_host, allow_input=True):
         web_host = parsed_host.scheme + "://" + parsed_host.netloc.replace('api.', 'app.', 1) + parsed_host.path
         files_host = parsed_host.scheme + "://" + parsed_host.netloc.replace('api.', 'files.', 1) + parsed_host.path
     elif parsed_host.port == 8008:
-        print('Port 8008 is the api port. Replacing 8080 with 8008 for Web application')
+        print('Port 8008 is the api port. Replacing 8008 with 8080 for Web application')
         api_host = parsed_host.scheme + "://" + parsed_host.netloc + parsed_host.path
         web_host = parsed_host.scheme + "://" + parsed_host.netloc.replace(':8008', ':8080', 1) + parsed_host.path
         files_host = parsed_host.scheme + "://" + parsed_host.netloc.replace(':8008', ':8081', 1) + parsed_host.path
     elif parsed_host.port == 8080:
+        print('Port 8080 is the web port. Replacing 8080 with 8008 for API server')
         api_host = parsed_host.scheme + "://" + parsed_host.netloc.replace(':8080', ':8008', 1) + parsed_host.path
         web_host = parsed_host.scheme + "://" + parsed_host.netloc + parsed_host.path
         files_host = parsed_host.scheme + "://" + parsed_host.netloc.replace(':8080', ':8081', 1) + parsed_host.path
-    elif allow_input:
+    else:
+        print("Warning! Could not parse host name")
         api_host = ''
         web_host = ''
         files_host = ''
-        if not parsed_host.port:
-            print('Host port not detected, do you wish to use the default 8080 port n/[y]? ', end='')
-            replace_port = input().lower()
-            if not replace_port or replace_port == 'y' or replace_port == 'yes':
-                api_host = parsed_host.scheme + "://" + parsed_host.netloc + ':8008' + parsed_host.path
-                web_host = parsed_host.scheme + "://" + parsed_host.netloc + ':8080' + parsed_host.path
-                files_host = parsed_host.scheme + "://" + parsed_host.netloc + ':8081' + parsed_host.path
-            elif not replace_port or replace_port.lower() == 'n' or replace_port.lower() == 'no':
-                web_host = input_host_port("Web", parsed_host)
-                api_host = input_host_port("API", parsed_host)
-                files_host = input_host_port("Files", parsed_host)
-        if not api_host:
-            api_host = parsed_host.scheme + "://" + parsed_host.netloc + parsed_host.path
-    else:
-        raise ValueError("Could not parse host name")
 
     return api_host, files_host, web_host
 

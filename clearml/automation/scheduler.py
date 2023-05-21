@@ -76,6 +76,7 @@ class ScheduleJob(BaseScheduleJob):
     _next_run = attrib(type=datetime, converter=datetime_from_isoformat, default=None)
     _execution_timeout = attrib(type=datetime, converter=datetime_from_isoformat, default=None)
     _last_executed = attrib(type=datetime, converter=datetime_from_isoformat, default=None)
+    _schedule_counter = attrib(type=int, default=0)
 
     def verify(self):
         # type: () -> None
@@ -143,6 +144,7 @@ class ScheduleJob(BaseScheduleJob):
 
             return self._next_run
 
+        # check if we have a specific day of the week
         weekday = None
         if self.weekdays:
             # get previous weekday
@@ -154,8 +156,27 @@ class ScheduleJob(BaseScheduleJob):
                 prev_weekday_ind = -1
             weekday = _weekdays[(prev_weekday_ind+1) % len(_weekdays)]
 
-        # check if we have a specific day of the week
         prev_timestamp = self._last_executed or self.starting_time
+        # fix first scheduled job should be as close as possible to starting time
+        if self._schedule_counter < 1:
+            # we should get here the first time we need to schedule a job, after that the delta is fixed
+            # If we have execute_immediately we need to get here after the first execution
+            # (so even through we have self._last_executed)
+
+            # if this is a daily schedule and we can still run it today, then we should
+            run0 = self._calc_next_run(self.starting_time, weekday)
+            run1 = self._calc_next_run(run0, weekday)
+            delta = run1-run0
+            optional_first_timestamp = self._calc_next_run(prev_timestamp-delta, weekday)
+            if optional_first_timestamp > prev_timestamp:
+                # this is us, we can still run it
+                self._next_run = optional_first_timestamp
+                return self._next_run
+
+        self._next_run = self._calc_next_run(prev_timestamp, weekday)
+        return self._next_run
+
+    def _calc_next_run(self, prev_timestamp, weekday):
         # make sure that if we have a specific day we zero the minutes/hours/seconds
         if self.year:
             prev_timestamp = datetime(
@@ -199,8 +220,9 @@ class ScheduleJob(BaseScheduleJob):
                     minutes=self.minute or 0,
                     weekday=weekday
                 )
-            self._next_run = next_timestamp
-            return self._next_run
+
+            return next_timestamp
+
         elif self.day is not None and weekday is not None:
             # push to the next day (so we only have once a day)
             prev_timestamp = datetime(
@@ -209,14 +231,14 @@ class ScheduleJob(BaseScheduleJob):
                 day=prev_timestamp.day,
             ) + relativedelta(days=1)
         elif self.day:
-            # reset minutes in the hour (we will be adding additional hour anyhow
+            # reset minutes in the hour (we will be adding additional hour/minute anyhow)
             prev_timestamp = datetime(
                 year=prev_timestamp.year,
                 month=prev_timestamp.month,
                 day=prev_timestamp.day,
             )
         elif self.hour:
-            # reset minutes in the hour (we will be adding additional hour anyhow
+            # reset minutes in the hour (we will be adding additional minutes anyhow)
             prev_timestamp = datetime(
                 year=prev_timestamp.year,
                 month=prev_timestamp.month,
@@ -224,7 +246,7 @@ class ScheduleJob(BaseScheduleJob):
                 hour=prev_timestamp.hour,
             )
 
-        self._next_run = prev_timestamp + relativedelta(
+        return prev_timestamp + relativedelta(
             years=self.year or 0,
             months=0 if self.year else (self.month or 0),
             days=0 if self.month or self.year else ((self.day or 0) if weekday is None else 0),
@@ -232,11 +254,13 @@ class ScheduleJob(BaseScheduleJob):
             minutes=self.minute or 0,
             weekday=weekday,
         )
-        return self._next_run
 
     def run(self, task_id):
         # type: (Optional[str]) -> datetime
         super(ScheduleJob, self).run(task_id)
+        if self._last_executed or self.starting_time != datetime.fromtimestamp(0):
+            self._schedule_counter += 1
+
         self._last_executed = datetime.utcnow()
         if self.execution_limit_hours and task_id:
             self._execution_timeout = self._last_executed + relativedelta(
@@ -491,11 +515,11 @@ class TaskScheduler(BaseScheduler):
         Create a Task scheduler service
 
         :param sync_frequency_minutes: Sync task scheduler configuration every X minutes.
-        Allow to change scheduler in runtime by editing the Task configuration object
+            Allow to change scheduler in runtime by editing the Task configuration object
         :param force_create_task_name: Optional, force creation of Task Scheduler service,
-        even if main Task.init already exists.
+            even if main Task.init already exists.
         :param force_create_task_project: Optional, force creation of Task Scheduler service,
-        even if main Task.init already exists.
+            even if main Task.init already exists.
         """
         super(TaskScheduler, self).__init__(
             sync_frequency_minutes=sync_frequency_minutes,
@@ -529,54 +553,65 @@ class TaskScheduler(BaseScheduler):
     ):
         # type: (...) -> bool
         """
-        Create a cron job alike scheduling for a pre existing Task.
-        Notice it is recommended to give the schedule entry a descriptive unique name,
-        if not provided a task ID is used.
+        Create a cron job-like scheduling for a pre-existing Task.
+        Notice, it is recommended to give the schedule entry a descriptive unique name,
+        if not provided, a name is randomly generated.
+
+        When timespec parameters are specified exclusively, they define the time between task launches (see
+        `year` and `weekdays` exceptions). When multiple timespec parameters are specified, the parameter representing
+        the longest duration defines the time between task launches, and the shorter timespec parameters define specific
+        times.
 
         Examples:
-        Launch every 15 minutes
-            add_task(task_id='1235', queue='default', minute=15)
-        Launch every 1 hour
-            add_task(task_id='1235', queue='default', hour=1)
-        Launch every 1 hour and at hour:30 minutes (i.e. 1:30, 2:30 etc.)
-            add_task(task_id='1235', queue='default', hour=1, minute=30)
-        Launch every day at 22:30 (10:30 pm)
-            add_task(task_id='1235', queue='default', minute=30, hour=22, day=1)
-        Launch every other day at 7:30 (7:30 am)
-            add_task(task_id='1235', queue='default', minute=30, hour=7, day=2)
-        Launch every Saturday at 8:30am (notice `day=0`)
-            add_task(task_id='1235', queue='default', minute=30, hour=8, day=0, weekdays=['saturday'])
-        Launch every 2 hours on the weekends Saturday/Sunday (notice `day` is not passed)
-            add_task(task_id='1235', queue='default', hour=2, weekdays=['saturday', 'sunday'])
-        Launch once a month at the 5th of each month
-            add_task(task_id='1235', queue='default', month=1, day=5)
-        Launch once a year on March 4th of each year
-            add_task(task_id='1235', queue='default', year=1, month=3, day=4)
 
-        :param schedule_task_id: Task/task ID to be cloned and scheduled for execution
+        Launch every 15 minutes
+            add_task(schedule_task_id='1235', queue='default', minute=15)
+        Launch every 1 hour
+            add_task(schedule_task_id='1235', queue='default', hour=1)
+        Launch every 1 hour at hour:30 minutes (i.e. 1:30, 2:30 etc.)
+            add_task(schedule_task_id='1235', queue='default', hour=1, minute=30)
+        Launch every day at 22:30 (10:30 pm)
+            add_task(schedule_task_id='1235', queue='default', minute=30, hour=22, day=1)
+        Launch every other day at 7:30 (7:30 am)
+            add_task(schedule_task_id='1235', queue='default', minute=30, hour=7, day=2)
+        Launch every Saturday at 8:30am (notice `day=0`)
+            add_task(schedule_task_id='1235', queue='default', minute=30, hour=8, day=0, weekdays=['saturday'])
+        Launch every 2 hours on the weekends Saturday/Sunday (notice `day` is not passed)
+            add_task(schedule_task_id='1235', queue='default', hour=2, weekdays=['saturday', 'sunday'])
+        Launch once a month at the 5th of each month
+            add_task(schedule_task_id='1235', queue='default', month=1, day=5)
+        Launch once a year on March 4th
+            add_task(schedule_task_id='1235', queue='default', year=1, month=3, day=4)
+
+        :param schedule_task_id: ID of Task to be cloned and scheduled for execution
         :param schedule_function: Optional, instead of providing Task ID to be scheduled,
             provide a function to be called. Notice the function is called from the scheduler context
             (i.e. running on the same machine as the scheduler)
-        :param queue: Queue name or ID to put the Task into (i.e. schedule)
-        :param name: Name or description for the cron Task (should be unique if provided otherwise randomly generated)
+        :param queue: Name or ID of queue to put the Task into (i.e. schedule)
+        :param name: Name or description for the cron Task (should be unique if provided, otherwise randomly generated)
         :param target_project: Specify target project to put the cloned scheduled Task in.
-        :param minute: If specified launch Task at a specific minute of the day (Valid values 0-60)
-        :param hour: If specified launch Task at a specific hour (24h) of the day (Valid values 0-24)
-        :param day: If specified launch Task at a specific day (Valid values 1-31)
-        :param weekdays: If specified a list of week days to schedule the Task in (assuming day, not given)
-        :param month: If specified launch Task at a specific month (Valid values 1-12)
-        :param year: If specified launch Task at a specific year
+        :param minute: Time (in minutes) between task launches. If specified together with `hour`, `day`, `month`,
+            and / or  `year`, it defines the minute of the hour
+        :param hour: Time (in hours) between task launches. If specified together with `day`, `month`, and / or
+            `year`, it defines the hour of day.
+        :param day: Time (in days) between task executions. If specified together with  `month` and / or `year`,
+            it defines the day of month
+        :param weekdays: Days of week to launch task (accepted inputs: 'monday', 'tuesday', 'wednesday',
+            'thursday', 'friday', 'saturday', 'sunday')
+        :param month: Time (in months) between task launches. If specified with `year`, it defines a specific month
+        :param year: Specific year if value >= current year. Time (in years) between task launches if
+            value <= 100
         :param limit_execution_time: Limit the execution time (in hours) of the specific job.
         :param single_instance: If True, do not launch the Task job if the previous instance is still running
-        (skip until the next scheduled time period). Default False.
-        :param recurring: If False only launch the Task once (default: True, repeat)
-        :param execute_immediately: If True, schedule the Task to be execute immediately
-        then recurring based on the timing schedule arguments. Default False.
+            (skip until the next scheduled time period). Default False.
+        :param recurring: If False, only launch the Task once (default: True, repeat)
+        :param execute_immediately: If True, schedule the Task to be executed immediately
+            then recurring based on the timing schedule arguments. Default False.
         :param reuse_task: If True, re-enqueue the same Task (i.e. do not clone it) every time, default False.
         :param task_parameters: Configuration parameters to the executed Task.
-        for example: {'Args/batch': '12'} Notice: not available when reuse_task=True
+            for example: {'Args/batch': '12'} Notice: not available when reuse_task=True
         :param task_overrides: Change task definition.
-        for example {'script.version_num': None, 'script.branch': 'main'} Notice: not available when reuse_task=True
+            for example {'script.version_num': None, 'script.branch': 'main'} Notice: not available when reuse_task=True
 
         :return: True if job is successfully added to the scheduling list
         """
@@ -659,8 +694,9 @@ class TaskScheduler(BaseScheduler):
             [j for j in self._schedule_jobs if j.next_run() is not None],
             key=lambda x: x.next_run()
         )
-        timeout_jobs = sorted(list(self._timeout_jobs.values()))
-        if not scheduled_jobs and not timeout_jobs:
+        # sort by key
+        timeout_job_datetime = min(self._timeout_jobs, key=self._timeout_jobs.get) if self._timeout_jobs else None
+        if not scheduled_jobs and timeout_job_datetime is None:
             # sleep and retry
             seconds = 60. * self._sync_frequency_minutes
             self._log('Nothing to do, sleeping for {:.2f} minutes.'.format(seconds / 60.))
@@ -668,25 +704,26 @@ class TaskScheduler(BaseScheduler):
             return False
 
         next_time_stamp = scheduled_jobs[0].next_run() if scheduled_jobs else None
-        if timeout_jobs:
-            next_time_stamp = min(timeout_jobs[0], next_time_stamp) \
-                if next_time_stamp else timeout_jobs[0]
+        if timeout_job_datetime is not None:
+            next_time_stamp = (
+                min(next_time_stamp, timeout_job_datetime) if next_time_stamp else timeout_job_datetime
+            )
 
         sleep_time = (next_time_stamp - datetime.utcnow()).total_seconds()
         if sleep_time > 0:
             # sleep until we need to run a job or maximum sleep time
             seconds = min(sleep_time, 60. * self._sync_frequency_minutes)
-            self._log('Waiting for next run, sleeping for {:.2f} minutes, until next sync.'.format(seconds / 60.))
+            self._log('Waiting for next run [UTC {}], sleeping for {:.2f} minutes, until next sync.'.format(
+                next_time_stamp, seconds / 60.))
             sleep(seconds)
             return False
 
         # check if this is a Task timeout check
-        if timeout_jobs and next_time_stamp == timeout_jobs[0]:
-            self._log('Aborting timeout job: {}'.format(timeout_jobs[0]))
-            # mark aborted
-            task_id = [k for k, v in self._timeout_jobs.items() if v == timeout_jobs[0]][0]
+        if timeout_job_datetime is not None and next_time_stamp == timeout_job_datetime:
+            task_id = self._timeout_jobs[timeout_job_datetime]
+            self._log('Aborting job due to timeout: {}'.format(task_id))
             self._cancel_task(task_id=task_id)
-            self._timeout_jobs.pop(task_id, None)
+            self._timeout_jobs.pop(timeout_job_datetime, None)
         else:
             self._log('Launching job: {}'.format(scheduled_jobs[0]))
             self._launch_job(scheduled_jobs[0])
@@ -723,16 +760,12 @@ class TaskScheduler(BaseScheduler):
         json_str = json.dumps(
             dict(
                 scheduled_jobs=[j.to_dict(full=True) for j in self._schedule_jobs],
-                timeout_jobs=self._timeout_jobs,
-                executed_jobs=[j.to_dict(full=True) for j in self._executed_jobs],
+                timeout_jobs={datetime_to_isoformat(k): v for k, v in self._timeout_jobs.items()},
+                executed_jobs=[j.to_dict(full=True) for j in self._executed_jobs]
             ),
             default=datetime_to_isoformat
         )
-        self._task.upload_artifact(
-            name='state',
-            artifact_object=json_str,
-            preview='scheduler internal state'
-        )
+        self._task.upload_artifact(name="state", artifact_object=json_str, preview="scheduler internal state")
 
     def _deserialize_state(self):
         # type: () -> None
@@ -750,7 +783,7 @@ class TaskScheduler(BaseScheduler):
                     serialized_jobs_dicts=state_dict.get('scheduled_jobs', []),
                     current_jobs=self._schedule_jobs
                 )
-                self._timeout_jobs = state_dict.get('timeout_jobs') or {}
+                self._timeout_jobs = {datetime_from_isoformat(k): v for k, v in (state_dict.get('timeout_jobs') or {})}
                 self._executed_jobs = [ExecutedJob(**j) for j in state_dict.get('executed_jobs', [])]
 
     def _deserialize(self):

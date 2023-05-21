@@ -323,6 +323,8 @@ class Entity(object):
             pass
 
         func = getattr(self._service, attr)
+        if not callable(func):
+            return func
 
         @wrap_request_class(func)
         def new_func(*args, **kwargs):
@@ -408,7 +410,9 @@ def make_action(service, request_cls):
 
     elif action in ["get_all", "get_all_ex"]:
         # noinspection PyProtectedMember
-        dest = service.response_mapping[request_cls]._get_data_props().popitem()[0]
+        for dest in service.response_mapping[request_cls]._get_data_props().keys():
+            if dest != "scroll_id":
+                break
 
         @wrap
         def get(self, *args, **kwargs):

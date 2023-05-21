@@ -1,12 +1,14 @@
+import sys
 from argparse import ArgumentParser
-import torch
+
 import pytorch_lightning as pl
+import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, random_split
-from clearml import Task
-
-from torchvision.datasets.mnist import MNIST
 from torchvision import transforms
+from torchvision.datasets.mnist import MNIST
+
+from clearml import Task
 
 
 class LitClassifier(pl.LightningModule):
@@ -34,12 +36,13 @@ class LitClassifier(pl.LightningModule):
         y_hat = self(x)
         loss = F.cross_entropy(y_hat, y)
         self.log('valid_loss', loss)
+        return loss
 
     def test_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
         loss = F.cross_entropy(y_hat, y)
-        self.log('test_loss', loss)
+        return loss
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
@@ -53,18 +56,16 @@ class LitClassifier(pl.LightningModule):
 
 
 if __name__ == '__main__':
-    # Connecting ClearML with the current process,
-    # from here on everything is logged automatically
-    task = Task.init(project_name="examples", task_name="pytorch lightning mnist example")
-
     pl.seed_everything(0)
 
     parser = ArgumentParser()
     parser.add_argument('--batch_size', default=32, type=int)
-    parser.add_argument('--epochs', default=3, type=int)
-    parser = pl.Trainer.add_argparse_args(parser)
+    parser.add_argument('--max_epochs', default=3, type=int)
+    sys.argv.extend(['--max_epochs', '2'])
     parser = LitClassifier.add_model_specific_args(parser)
     args = parser.parse_args()
+
+    Task.init(project_name="examples-internal", task_name="lightning checkpoint issue and argparser")
 
     # ------------
     # data
@@ -85,11 +86,10 @@ if __name__ == '__main__':
     # ------------
     # training
     # ------------
-    trainer = pl.Trainer.from_argparse_args(args)
-    trainer.max_epochs = args.epochs
+    trainer = pl.Trainer(max_epochs=args.max_epochs)
     trainer.fit(model, train_loader, val_loader)
 
     # ------------
     # testing
     # ------------
-    trainer.test(test_dataloaders=test_loader)
+    trainer.test(dataloaders=test_loader)

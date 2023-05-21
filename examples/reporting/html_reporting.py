@@ -3,7 +3,7 @@
 import math
 
 import numpy as np
-from bokeh.models import ColumnDataSource, GraphRenderer, Oval, StaticLayoutProvider
+from bokeh.models import ColumnDataSource, GraphRenderer, Ellipse, StaticLayoutProvider
 from bokeh.palettes import Spectral5, Spectral8
 from bokeh.plotting import figure, output_file, save
 from bokeh.sampledata.autompg import autompg_clean as bokeh_df
@@ -20,7 +20,7 @@ def report_html_url(logger, iteration=0):
     :param logger: The task.logger to use for sending the plots
     :param iteration: The iteration number of the current reports
     """
-    logger.report_media("html", "url_html", iteration=iteration, url="https://allegro.ai/docs/index.html")
+    logger.report_media("html", "url_html", iteration=iteration, url="https://clear.ml/docs/latest/docs/index.html")
 
 
 def report_html_periodic_table(logger, iteration=0):
@@ -52,8 +52,8 @@ def report_html_periodic_table(logger, iteration=0):
     }
     source = ColumnDataSource(autompg_clean)
     p = figure(
-        plot_width=900,
-        plot_height=500,
+        width=900,
+        height=500,
         title="Periodic Table (omitting LA and AC Series)",
         x_range=groups,
         y_range=list(reversed(periods)),
@@ -129,8 +129,8 @@ def report_html_groupby(logger, iteration=0):
         "cyl_mfr", palette=Spectral5, factors=sorted(bokeh_df.cyl.unique()), end=1
     )
     p = figure(
-        plot_width=800,
-        plot_height=300,
+        width=800,
+        height=300,
         title="Mean MPG by # Cylinders and Manufacturer",
         x_range=group,
         toolbar_location=None,
@@ -178,7 +178,7 @@ def report_html_graph(logger, iteration=0):
     graph = GraphRenderer()
     graph.node_renderer.data_source.add(node_indices, "index")
     graph.node_renderer.data_source.add(Spectral8, "color")
-    graph.node_renderer.glyph = Oval(height=0.1, width=0.2, fill_color="color")
+    graph.node_renderer.glyph = Ellipse(height=0.1, width=0.2, fill_color="color")
     graph.edge_renderer.data_source.data = dict(start=[0] * nodes, end=node_indices)
     # start of layout code
     circ = [i * 2 * math.pi / 8 for i in node_indices]
@@ -219,7 +219,7 @@ def report_html_image(logger, iteration=0):
 def main():
     # Connecting ClearML with the current process,
     # from here on everything is logged automatically
-    task = Task.init(project_name="examples", task_name="html samples reporting")
+    task = Task.init(project_name="examples", task_name="HTML samples reporting")
 
     print('reporting html files into debug samples section')
 

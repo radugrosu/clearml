@@ -56,6 +56,7 @@ class PlotlyRenderer(Renderer):
         self.current_mpl_ax = None
         self.bar_containers = None
         self.current_bars = []
+        self.current_bars_names = []
         self.axis_ct = 0
         self.x_is_mpl_date = False
         self.mpl_x_bounds = (0, 1)
@@ -159,12 +160,16 @@ class PlotlyRenderer(Renderer):
         yaxis = dict(
             anchor="x{0}".format(self.axis_ct or ''), zeroline=False, ticks="inside"
         )
+        zaxis = dict(
+            anchor="x{0}".format(self.axis_ct or ''), zeroline=False, ticks="inside"
+        )
         # update defaults with things set in mpl
-        mpl_xaxis, mpl_yaxis = mpltools.prep_xy_axis(
+        mpl_xaxis, mpl_yaxis, mpl_zaxis = mpltools.prep_xyz_axis(
             ax=ax, props=props, x_bounds=self.mpl_x_bounds, y_bounds=self.mpl_y_bounds
         )
         xaxis.update(mpl_xaxis)
         yaxis.update(mpl_yaxis)
+        zaxis.update(mpl_zaxis)
         bottom_spine = mpltools.get_spine_visible(ax, "bottom")
         top_spine = mpltools.get_spine_visible(ax, "top")
         left_spine = mpltools.get_spine_visible(ax, "left")
@@ -177,6 +182,8 @@ class PlotlyRenderer(Renderer):
         # put axes in our figure
         self.plotly_fig["layout"]["xaxis{0}".format(self.axis_ct or '')] = xaxis
         self.plotly_fig["layout"]["yaxis{0}".format(self.axis_ct or '')] = yaxis
+        if mpl_zaxis:
+            self.plotly_fig["layout"]["zaxis{0}".format(self.axis_ct or '')] = zaxis
 
         # let all subsequent dates be handled properly if required
 
@@ -197,6 +204,12 @@ class PlotlyRenderer(Renderer):
         ax -- an mpl axes object, not required at this time.
 
         """
+        if self.current_bars:
+            # noinspection PyBroadException
+            try:
+                self.current_bars_names = [n.get_text() for n in ax.legend().texts]
+            except Exception:
+                pass
         self.draw_bars(self.current_bars)
         self.msg += "  Closing axes\n"
         self.x_is_mpl_date = False
@@ -213,10 +226,10 @@ class PlotlyRenderer(Renderer):
                     if bar_props["mplobj"] in container
                 ]
             )
-        for trace in mpl_traces:
-            self.draw_bar(trace)
+        for i, trace in enumerate(mpl_traces):
+            self.draw_bar(trace, self.current_bars_names[i] if i < len(self.current_bars_names) else None)
 
-    def draw_bar(self, coll):
+    def draw_bar(self, coll, name=None):
         """Draw a collection of similar patches as a bar chart.
 
         After bars are sorted, an appropriate data dictionary must be created
@@ -236,7 +249,7 @@ class PlotlyRenderer(Renderer):
         horizontal = (
             abs(sum(heights[0] - heights[iii] for iii in range(len(heights)))) < tol
         )
-        if vertical and horizontal:
+        if (vertical and horizontal) or (not vertical and not horizontal):
             # Check for monotonic x. Can't both be true!
             x_zeros = [bar_props["x0"] for bar_props in trace]
             if all(
@@ -302,6 +315,8 @@ class PlotlyRenderer(Renderer):
                 line=dict(width=trace[0]["edgewidth"]),
             ),
         )  # TODO ditto
+        if name:
+            bar["name"] = name
         if len(bar["x"]) > 1:
             self.msg += "    Heck yeah, I drew that bar chart\n"
             self.plotly_fig['data'].append(bar)
@@ -384,18 +399,26 @@ class PlotlyRenderer(Renderer):
             marked_line = dict(
                 type="scatter",
                 mode=mode,
-                name=(
-                    str(props["label"])
-                    if isinstance(props["label"], six.string_types)
-                    else props["label"]
-                ),
-                x=[xy_pair[0] for xy_pair in props["data"]],
-                y=[xy_pair[1] for xy_pair in props["data"]],
+                name=(str(props["label"]) if isinstance(props["label"], six.string_types) else props["label"]),
+                x=props["data"][0]
+                if props.get("type") == "collection" and props.get("is_3d")
+                else [xy_pair[0] for xy_pair in props["data"]],
+                y=props["data"][1]
+                if props.get("type") == "collection" and props.get("is_3d")
+                else [xy_pair[1] for xy_pair in props["data"]],
                 xaxis="x{0}".format(self.axis_ct),
                 yaxis="y{0}".format(self.axis_ct),
                 line=line,
                 marker=marker,
             )
+            if props.get("is_3d"):
+                marked_line["z"] = (
+                    props["data"][2]
+                    if props.get("type") == "collection"
+                    else [xyz_tuple[2] for xyz_tuple in props["data"]]
+                )
+                marked_line["type"] = "scatter3d"
+                marked_line["zaxis"] = "z{0}".format(self.axis_ct)
             if self.x_is_mpl_date:
                 formatter = (
                     self.current_mpl_ax.get_xaxis()
@@ -429,7 +452,7 @@ class PlotlyRenderer(Renderer):
             "images from matplotlib yet!"
         )
 
-    def draw_path_collection(self, **props):
+    def draw_path_collection(self, ax, **props):
         """Add a path collection to data list as a scatter plot.
 
         Current implementation defaults such collections as scatter plots.
@@ -468,6 +491,8 @@ class PlotlyRenderer(Renderer):
                 "label": None,
                 "markerstyle": markerstyle,
                 "linestyle": None,
+                "type": "collection",
+                "is_3d": "3d" in str(type(ax)).split(".")[-1].lower()
             }
             self.msg += "    Drawing path collection as markers\n"
             self.draw_marked_line(**scatter_props)

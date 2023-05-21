@@ -164,11 +164,59 @@ class UniformParameterRange(Parameter):
         :return: list of dicts {name: float}
         """
         step_size = self.step_size or (self.max_value - self.min_value) / 100.
-        steps = (self.max_value - self.min_value) / self.step_size
-        values = [v*step_size for v in range(0, int(steps))]
+        steps = (self.max_value - self.min_value) / step_size
+        values = [self.min_value + v*step_size for v in range(0, int(steps))]
         if self.include_max and (not values or values[-1] < self.max_value):
             values.append(self.max_value)
         return [{self.name: v} for v in values]
+
+
+class LogUniformParameterRange(UniformParameterRange):
+    """
+    Logarithmic uniform randomly sampled hyper-parameter object.
+    """
+
+    def __init__(
+            self,
+            name,  # type: str
+            min_value,  # type: float
+            max_value,  # type: float
+            base=10,  # type: float
+            step_size=None,  # type: Optional[float]
+            include_max_value=True  # type: bool
+    ):
+        # type: (...) -> ()
+        """
+        Create a parameter to be sampled by the SearchStrategy
+
+        :param str name: The parameter name. Match the Task hyper-parameter name.
+        :param float min_value: The minimum exponent sample to use for uniform random sampling.
+        :param float max_value: The maximum exponent sample to use for uniform random sampling.
+        :param float base: The base used to raise the sampled exponent.
+        :param float step_size: If not ``None``, set step size (quantization) for value sampling.
+        :param bool include_max_value: Range includes the ``max_value``
+
+            The values are:
+
+            - ``True`` - The range includes the ``max_value`` (Default)
+            - ``False`` -  Does not include.
+
+        """
+        super().__init__(name, min_value, max_value, step_size=step_size, include_max_value=include_max_value)
+        self.base = base
+
+    def get_value(self):
+        """
+        Return uniformly logarithmic sampled value based on object sampling definitions.
+
+        :return: {self.name: random value self.base^[self.min_value, self.max_value)}
+        """
+        values_dict = super().get_value()
+        return {self.name: self.base**v for v in values_dict.values()}
+
+    def to_list(self):
+        values_list = super().to_list()
+        return [{self.name: self.base**v[self.name]} for v in values_list]
 
 
 class UniformIntegerParameterRange(Parameter):
@@ -275,15 +323,15 @@ class ParameterSet(Parameter):
 
             .. code-block:: javascript
 
-               [ {'opt1': 10, 'arg2': 20, 'arg2': 30},
-                 {'opt2': 11, 'arg2': 22, 'arg2': 33}, ]
+               [ {"opt1": 10, "arg2": 20, "arg2": 30},
+                 {"opt2": 11, "arg2": 22, "arg2": 33} ]
 
             Two complex combination each one sampled from a different range:
 
             .. code-block:: javascript
 
-               [ {'opt1': UniformParameterRange('arg1',0,1) , 'arg2': 20},
-                 {'opt2': UniformParameterRange('arg1',11,12), 'arg2': 22},]
+               [ {"opt1": UniformParameterRange('arg1',0,1) , "arg2": 20},
+                 {"opt2": UniformParameterRange('arg1',11,12), "arg2": 22},]
         """
         super(ParameterSet, self).__init__(name=None)
         self.values = parameter_combinations

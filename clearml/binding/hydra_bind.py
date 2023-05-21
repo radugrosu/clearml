@@ -46,6 +46,8 @@ class PatchHydra(object):
     def update_current_task(task):
         # set current Task before patching
         PatchHydra._current_task = task
+        if not task:
+            return
         if PatchHydra.patch_hydra():
             # check if we have an untracked state, store it.
             if PatchHydra._last_untracked_state.get('connect'):
@@ -90,6 +92,17 @@ class PatchHydra(object):
 
     @staticmethod
     def _patched_run_job(config, task_function, *args, **kwargs):
+        # noinspection PyBroadException
+        try:
+            from hydra.core.utils import JobStatus
+
+            failed_status = JobStatus.FAILED
+        except Exception:
+            LoggerRoot.get_base_logger(PatchHydra).warning(
+                "Could not import JobStatus from Hydra. Failed tasks will be marked as completed"
+            )
+            failed_status = None
+
         # store the config
         # noinspection PyBroadException
         try:
@@ -115,16 +128,30 @@ class PatchHydra(object):
 
         if pre_app_task_init_call and not running_remotely():
             LoggerRoot.get_base_logger(PatchHydra).info(
-                'Task.init called outside of Hydra-App. For full Hydra multi-run support, '
-                'move the Task.init call into the Hydra-App main function')
+                "Task.init called outside of Hydra-App. For full Hydra multi-run support, "
+                "move the Task.init call into the Hydra-App main function"
+            )
 
         kwargs["config"] = config
         kwargs["task_function"] = partial(PatchHydra._patched_task_function, task_function,)
         result = PatchHydra._original_run_job(*args, **kwargs)
+        # noinspection PyBroadException
+        try:
+            result_status = result.status
+        except Exception:
+            LoggerRoot.get_base_logger(PatchHydra).warning(
+                "Could not get Hydra job status. Failed tasks will be marked as completed"
+            )
+            result_status = None
 
         # if we have Task.init called inside the App, we close it after the app is done.
         # This will make sure that hydra run will create multiple Tasks
-        if not running_remotely() and not pre_app_task_init_call and PatchHydra._current_task:
+        if (
+            not running_remotely()
+            and not pre_app_task_init_call
+            and PatchHydra._current_task
+            and (failed_status is None or result_status is None or result_status != failed_status)
+        ):
             PatchHydra._current_task.close()
             # make sure we do not reuse the Task if we have a multi-run session
             DEV_TASK_NO_REUSE.set(True)

@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 
-import os
 import sys
 import threading
 from copy import deepcopy
@@ -54,7 +53,7 @@ class PatchedMatplotlib:
     def force_report_as_image(force):
         # type: (bool) -> None
         """
-        Set force_report_as_image. If True all matplotlib are always converted to images
+        Set force_report_as_image. If True, all matplotlib are always converted to images.
         Otherwise we try to convert them into interactive plotly plots.
         :param force: True force
         """
@@ -189,12 +188,15 @@ class PatchedMatplotlib:
         return True
 
     @staticmethod
-    def update_current_task(task):
+    def _get_global_image_counter_limit():
         # make sure we have a default vale
         if PatchedMatplotlib._global_image_counter_limit is None:
             from ..config import config
             PatchedMatplotlib._global_image_counter_limit = config.get('metric.matplotlib_untitled_history_size', 100)
+        return PatchedMatplotlib._global_image_counter_limit
 
+    @staticmethod
+    def update_current_task(task):
         # if we already patched it, just update the current task
         if PatchedMatplotlib._patched_original_plot is not None:
             PatchedMatplotlib._current_task = task
@@ -204,12 +206,15 @@ class PatchedMatplotlib:
             PatchedMatplotlib._current_task = task
             PostImportHookPatching.add_on_import('matplotlib.pyplot', PatchedMatplotlib.patch_matplotlib)
             PostImportHookPatching.add_on_import('matplotlib.pylab', PatchedMatplotlib.patch_matplotlib)
-        elif PatchedMatplotlib.patch_matplotlib():
+        else:
+            PatchedMatplotlib.patch_matplotlib()
             PatchedMatplotlib._current_task = task
 
     @staticmethod
     def patched_imshow(*args, **kw):
         ret = PatchedMatplotlib._patched_original_imshow(*args, **kw)
+        if not PatchedMatplotlib._current_task:
+            return ret
         try:
             from matplotlib import _pylab_helpers
             # store on the plot that this is an imshow plot
@@ -224,6 +229,8 @@ class PatchedMatplotlib:
     @staticmethod
     def patched_savefig(self, *args, **kw):
         ret = PatchedMatplotlib._patched_original_savefig(self, *args, **kw)
+        if not PatchedMatplotlib._current_task:
+            return ret
         # noinspection PyBroadException
         try:
             fname = kw.get('fname') or args[0]
@@ -253,6 +260,8 @@ class PatchedMatplotlib:
 
     @staticmethod
     def patched_figure_show(self, *args, **kw):
+        if not PatchedMatplotlib._current_task:
+            return PatchedMatplotlib._patched_original_figure(self, *args, **kw)
         tid = threading._get_ident() if six.PY2 else threading.get_ident()
         if PatchedMatplotlib._recursion_guard.get(tid):
             # we are inside a gaurd do nothing
@@ -266,6 +275,8 @@ class PatchedMatplotlib:
 
     @staticmethod
     def patched_show(*args, **kw):
+        if not PatchedMatplotlib._current_task:
+            return PatchedMatplotlib._patched_original_plot(*args, **kw)
         tid = threading._get_ident() if six.PY2 else threading.get_ident()
         PatchedMatplotlib._recursion_guard[tid] = True
         # noinspection PyBroadException
@@ -375,6 +386,11 @@ class PatchedMatplotlib:
             if PatchedMatplotlib._force_report_as_image:
                 force_save_as_image = True
 
+            # if we have subplots, we will probably fail in conversion, so we just store as image
+            if not report_as_debug_sample and not force_save_as_image and \
+                    mpl_fig and getattr(mpl_fig, 'axes', None) and len(mpl_fig.axes) > 1:
+                force_save_as_image = True
+
             # convert to plotly
             image = None
             plotly_dict = None
@@ -400,42 +416,77 @@ class PatchedMatplotlib:
                         plotly_renderer = PatchedMatplotlib._matplotlylib.PlotlyRenderer()
                         PatchedMatplotlib._matplotlylib.Exporter(plotly_renderer, close_mpl=False).run(fig)
 
-                        x_ticks = list(plotly_renderer.current_mpl_ax.get_xticklabels())
-                        if x_ticks:
+                        def process_tick_text(ticks, axes, val_index):
+                            if not ticks:
+                                return
                             # noinspection PyBroadException
                             try:
                                 # check if all values can be cast to float
-                                _ = [float(t.get_text().replace('−', '-')) for t in x_ticks]
+                                _ = [float(t.get_text().replace("−", "-")) for t in ticks]
                             except Exception:
                                 # noinspection PyBroadException
                                 try:
-                                    _xaxis = next(x for x in ('xaxis', 'xaxis0', 'xaxis1')
-                                                  if x in plotly_renderer.plotly_fig['layout'])
-                                    plotly_renderer.plotly_fig['layout'][_xaxis].update({
-                                        'ticktext': [t.get_text() for t in x_ticks],
-                                        'tickvals': [t.get_position()[0] for t in x_ticks],
-                                    })
-                                    plotly_renderer.plotly_fig['layout'][_xaxis].pop('type', None)
+                                    def convert_latex_math_powers_to_html(text):
+                                        # noinspection PyBroadException
+                                        try:
+                                            if not text or not text.startswith("$\\mathdefault{") or not text.endswith("}}$"):
+                                                return text
+                                            numbers = text[len("$\\mathdefault{"): -len("}}$")].split("^{")
+                                            if len(numbers) != 2:
+                                                return text
+                                            base, exp_ = numbers[0], numbers[1]
+                                            return "{}<sup>{}</sup>".format(base, exp_)
+                                        except Exception:
+                                            return text
+
+                                    _axis = next(x for x in axes if x in plotly_renderer.plotly_fig["layout"])
+                                    plotly_renderer.plotly_fig["layout"][_axis].update(
+                                        {
+                                            "ticktext": [convert_latex_math_powers_to_html(t.get_text()) for t in ticks],
+                                            "tickvals": [t.get_position()[val_index] for t in ticks],
+                                        }
+                                    )
+                                    if plotly_renderer.plotly_fig["layout"][_axis].get("type") == "linear":
+                                        plotly_renderer.plotly_fig["layout"][_axis].pop("type", None)
                                 except Exception:
                                     pass
-                        y_ticks = list(plotly_renderer.current_mpl_ax.get_yticklabels())
-                        if y_ticks:
-                            # noinspection PyBroadException
-                            try:
-                                # check if all values can be cast to float
-                                _ = [float(t.get_text().replace('−', '-')) for t in y_ticks]
-                            except Exception:
-                                # noinspection PyBroadException
-                                try:
-                                    _yaxis = next(x for x in ('yaxis', 'yaxis0', 'yaxis1')
-                                                  if x in plotly_renderer.plotly_fig['layout'])
-                                    plotly_renderer.plotly_fig['layout']['_yaxis'].update({
-                                        'ticktext': [t.get_text() for t in y_ticks],
-                                        'tickvals': [t.get_position()[1] for t in y_ticks],
-                                    })
-                                    plotly_renderer.plotly_fig['layout'][_yaxis].pop('type', None)
-                                except Exception:
-                                    pass
+
+                        process_tick_text(
+                            list(plotly_renderer.current_mpl_ax.get_xticklabels()), ("xaxis", "xaxis0", "xaxis1"), 0
+                        )
+                        process_tick_text(
+                            list(plotly_renderer.current_mpl_ax.get_yticklabels()), ("yaxis", "yaxis0", "yaxis1"), 1
+                        )
+                        # noinspection PyBroadException
+                        try:
+                            # check if we have a 3d plot
+                            if (
+                                "zaxis" in plotly_renderer.plotly_fig.get("layout", {})
+                                or "zaxis0" in plotly_renderer.plotly_fig.get("layout", {})
+                                or "zaxis1" in plotly_renderer.plotly_fig.get("layout", {})
+                                or len(plotly_renderer.plotly_fig.get("data", [{}])[0].get("z", [])) > 0
+                            ):
+                                process_tick_text(
+                                    list(plotly_renderer.current_mpl_ax.get_zticklabels()),
+                                    ("zaxis", "zaxis0", "zaxis1"),
+                                    2,
+                                )
+
+                                # rotate the X axis -90 degrees such that it matches matplotlib
+                                plotly_renderer.plotly_fig.setdefault("layout", {}).setdefault("scene", {}).setdefault(
+                                    "camera", {}
+                                ).setdefault("eye", {}).setdefault("x", -1)
+
+                                # reverse the X and Y axes such that they match matplotlib
+                                plotly_renderer.plotly_fig.setdefault("layout", {}).setdefault("scene", {}).setdefault(
+                                    "xaxis", {}
+                                ).setdefault("autorange", "reversed")
+
+                                plotly_renderer.plotly_fig.setdefault("layout", {}).setdefault("scene", {}).setdefault(
+                                    "yaxis", {}
+                                ).setdefault("autorange", "reversed")
+                        except Exception:
+                            pass
 
                         # try to bring back legend
                         # noinspection PyBroadException
@@ -446,16 +497,17 @@ class PatchedMatplotlib:
                                 lines_ = plotly_renderer.plotly_fig['data']
                                 half_mark = len(lines_)//2
                                 if len(lines_) % 2 == 0 and \
-                                        all(ln for ln in lines_[half_mark:] if not ln.get('x') and not ln.get('y')):
+                                        all(not ln.get('x') and not ln.get('y') for ln in lines_[half_mark:]):
                                     for i, line in enumerate(lines_[:half_mark]):
                                         line['name'] = lines_[i+half_mark].get('name')
                         except Exception:
                             pass
 
                         # let plotly deal with the range in realtime (otherwise there is no real way to change it to
-                        plotly_renderer.plotly_fig.get('layout', {}).get('xaxis', {}).pop('range', None)
-                        plotly_renderer.plotly_fig.get('layout', {}).get('yaxis', {}).pop('range', None)
-
+                        if not plotly_renderer.plotly_fig.get("layout", {}).get("xaxis", {}).pop("custom_range", False):
+                            plotly_renderer.plotly_fig.get("layout", {}).get("xaxis", {}).pop("range", None)
+                        if not plotly_renderer.plotly_fig.get("layout", {}).get("yaxis", {}).pop("custom_range", False):
+                            plotly_renderer.plotly_fig.get("layout", {}).get("yaxis", {}).pop("range", None)
                         return deepcopy(plotly_renderer.plotly_fig)
 
                     plotly_dict = our_mpl_to_plotly(mpl_fig)
@@ -506,8 +558,8 @@ class PatchedMatplotlib:
                                       facecolor=None)
                     buffer_.seek(0)
                 fd, image = mkstemp(suffix='.' + image_format)
-                os.write(fd, buffer_.read())
-                os.close(fd)
+                with open(fd, "wb") as f:
+                    f.write(buffer_.read())
 
             # check if we need to restore the active object
             if set_active and not _pylab_helpers.Gcf.get_active() and stored_figure:
@@ -530,11 +582,11 @@ class PatchedMatplotlib:
                 elif report_as_debug_sample:
                     PatchedMatplotlib._global_image_counter += 1
                     title = 'untitled {:02d}'.format(
-                        PatchedMatplotlib._global_image_counter % PatchedMatplotlib._global_image_counter_limit)
+                        PatchedMatplotlib._global_image_counter % PatchedMatplotlib._get_global_image_counter_limit())
                 else:
                     PatchedMatplotlib._global_plot_counter += 1
                     title = 'untitled {:02d}'.format(
-                        PatchedMatplotlib._global_plot_counter % PatchedMatplotlib._global_image_counter_limit)
+                        PatchedMatplotlib._global_plot_counter % PatchedMatplotlib._get_global_image_counter_limit())
 
             # by now we should have a title, if the iteration was known list us as globally reported.
             # we later use it to check if externally someone was actually reporting iterations
